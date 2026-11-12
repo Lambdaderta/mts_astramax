@@ -1,0 +1,368 @@
+from __future__ import annotations
+import asyncio
+import hashlib
+import hmac
+import json
+import re
+import secrets
+import sqlite3
+import time
+from datetime import datetime, timezone
+from uuid import uuid4
+
+from .errors import APIError
+from .privacy import extract_contacts, manager_requested, redact
+from .ml.protocol import (ConsultationRequest, ConsultationResult, ConsultationUnavailable,
+                          CorpusNotReady, InvalidEvidence)
+
+
+def uid():
+    return str(uuid4())
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
+def packed(value):
+    return json.dumps(value, ensure_ascii=False, separators=(',', ':'))
+
+
+def public_session(row):
+    return {k: row[k] for k in ('id','status','phase','revision','opened_at','closed_at')}
+
+
+def public_message(row):
+    return {k: row[k] for k in ('id','seq','role','text','created_at')}
+
+
+def draft_view(row):
+    fields = {k: row[k] for k in ('full_name','phone','company')}
+    missing = [k for k,v in fields.items() if not v]
+    return {**fields, 'revision': row['revision'], 'missing_fields': missing,
+            'status': 'draft' if not fields['phone'] else ('partial' if missing else 'complete')}
+
+
+class Service:
+    def __init__(self, db, core, settings):
+        self.db, self.core, self.settings = db, core, settings
+        self.tasks: set[asyncio.Task] = set()
+
+    def authorize(self, sid, token):
+        if not token:
+            raise APIError(401,'UNAUTHORIZED','Требуется токен сессии.')
+        with self.db.read() as c:
+            row = c.execute('SELECT * FROM sessions WHERE id=?',(sid,)).fetchone()
+        if row is None:
+            raise APIError(404,'SESSION_NOT_FOUND','Сессия не найдена.')
+        if not hmac.compare_digest(row['token_hash'], hashlib.sha256(token.encode()).hexdigest()):
+            raise APIError(403,'FORBIDDEN','Нет доступа к этой сессии.')
+        return public_session(row)
+
+    def create_session(self):
+        sid, token, stamp = uid(), secrets.token_urlsafe(32), now()
+        with self.db.transaction() as c:
+            c.execute('INSERT INTO sessions VALUES (?,?,?,?,?,?,?)',
+                      (sid,hashlib.sha256(token.encode()).hexdigest(),'active','new',1,stamp,None))
+            c.execute('INSERT INTO lead_drafts VALUES (?,0,NULL,NULL,NULL,?)',(sid,stamp))
+            greeting = self.append_message(c,sid,'assistant','Здравствуйте! Расскажите, с какой задачей по энергоресурсам нужна помощь.')
+            session = self.session(c,sid)
+        return {'session':session,'session_token':token,'greeting':greeting}
+
+    def session(self,c,sid):
+        row=c.execute('SELECT * FROM sessions WHERE id=?',(sid,)).fetchone()
+        if not row:
+            raise APIError(404,'SESSION_NOT_FOUND','Сессия не найдена.')
+        return public_session(row)
+
+    def active(self,c,sid):
+        session=self.session(c,sid)
+        if session['status']=='closed':
+            raise APIError(409,'SESSION_CLOSED','Диалог закрыт. Создайте новый.')
+        return session
+
+    def recover(self,c,sid):
+        c.execute("UPDATE turns SET status='failed',error_code='INTERRUPTED',retryable=1,lease_until=NULL WHERE session_id=? AND status='processing' AND lease_until<=?",(sid,time.time()))
+
+    def idle(self,c,sid):
+        self.recover(c,sid)
+        row=c.execute("SELECT id FROM turns WHERE session_id=? AND status='processing'",(sid,)).fetchone()
+        if row:
+            raise APIError(409,'TURN_IN_PROGRESS','Предыдущий запрос еще обрабатывается.',True,{'active_turn_id':row['id']})
+
+    def append_message(self,c,sid,role,text):
+        seq=c.execute('SELECT COALESCE(MAX(seq),0)+1 FROM messages WHERE session_id=?',(sid,)).fetchone()[0]
+        mid,stamp=uid(),now()
+        c.execute('INSERT INTO messages VALUES (?,?,?,?,?,?)',(mid,sid,seq,role,text,stamp))
+        return {'id':mid,'seq':seq,'role':role,'text':text,'created_at':stamp}
+
+    def close_session(self,sid):
+        with self.db.transaction() as c:
+            self.idle(c,sid)
+            c.execute("UPDATE sessions SET status='closed',phase='closed',closed_at=?,revision=revision+1 WHERE id=? AND status='active'",(now(),sid))
+            return {'session':self.session(c,sid)}
+
+    def messages(self,sid,after_seq,limit):
+        with self.db.read() as c:
+            rows=c.execute('SELECT * FROM messages WHERE session_id=? AND seq>? ORDER BY seq LIMIT ?', (sid,after_seq,limit+1)).fetchall()
+        items=[public_message(r) for r in rows[:limit]]
+        return {'items':items,'next_after_seq':items[-1]['seq'] if len(rows)>limit else None}
+
+    def get_draft(self,sid):
+        with self.db.read() as c:
+            return {'draft':draft_view(c.execute('SELECT * FROM lead_drafts WHERE session_id=?',(sid,)).fetchone())}
+
+    def patch_draft(self,sid,patch):
+        with self.db.transaction() as c:
+            self.active(c,sid)
+            self.idle(c,sid)
+            draft=c.execute('SELECT * FROM lead_drafts WHERE session_id=?',(sid,)).fetchone()
+            if draft['revision']!=patch.expected_revision:
+                raise APIError(409,'DRAFT_VERSION_CONFLICT','Контакты изменились. Обновите форму.')
+            fields=patch.fields.model_dump(exclude_unset=True)
+            if fields:
+                self.update_contacts(c,sid,fields)
+                c.execute("UPDATE sessions SET phase='collecting_contacts',revision=revision+1 WHERE id=?",(sid,))
+            return {'draft':draft_view(c.execute('SELECT * FROM lead_drafts WHERE session_id=?',(sid,)).fetchone())}
+
+    def update_contacts(self,c,sid,fields):
+        # Keys are whitelisted by the typed form/extractor, never client SQL.
+        fields={k:v for k,v in fields.items() if k in ('full_name','phone','company')}
+        if not fields:
+            return
+        for field,value in fields.items():
+            previous=c.execute(f'SELECT {field} FROM lead_drafts WHERE session_id=?',(sid,)).fetchone()[0]
+            for contact in (previous,value):
+                if contact:
+                    c.execute('INSERT OR IGNORE INTO contact_history VALUES (?,?,?)',(sid,field,contact))
+        assignments=','.join(k+'=?' for k in fields)
+        c.execute(f'UPDATE lead_drafts SET {assignments},revision=revision+1,updated_at=? WHERE session_id=?',(*fields.values(),now(),sid))
+
+    def accept_turn(self,sid,payload):
+        text,client_id=payload.text,str(payload.client_message_id)
+        fingerprint=hashlib.sha256(text.encode()).hexdigest()
+        with self.db.transaction() as c:
+            self.recover(c,sid)
+            old=c.execute('SELECT * FROM turns WHERE session_id=? AND client_message_id=?',(sid,client_id)).fetchone()
+            if old:
+                if old['request_hash']!=fingerprint:
+                    raise APIError(409,'IDEMPOTENCY_CONFLICT','Этот ключ уже использован для другого сообщения.')
+                if old['status']!='failed' or not old['retryable']:
+                    return dict(old),False
+                self.active(c,sid)
+                self.idle(c,sid)
+                last=c.execute("SELECT id FROM messages WHERE session_id=? AND role='user' ORDER BY seq DESC LIMIT 1",(sid,)).fetchone()
+                if last['id']!=old['user_message_id']:
+                    raise APIError(409,'RETRY_SUPERSEDED','После этой реплики начат новый запрос. Повторите вопрос новым сообщением.')
+                c.execute("UPDATE turns SET status='processing',attempt=attempt+1,lease_until=?,error_code=NULL,retryable=0 WHERE id=?",(time.time()+self.settings.turn_lease_seconds,old['id']))
+                tid=old['id']
+            else:
+                self.active(c,sid)
+                self.idle(c,sid)
+                message=self.append_message(c,sid,'user',text)
+                tid=uid()
+                c.execute('INSERT INTO turns(id,session_id,client_message_id,request_hash,status,user_message_id,lease_until,created_at) VALUES (?,?,?,?,?,?,?,?)',
+                          (tid,sid,client_id,fingerprint,'processing',message['id'],time.time()+self.settings.turn_lease_seconds,now()))
+                self.update_contacts(c,sid,extract_contacts(text))
+            return dict(c.execute('SELECT * FROM turns WHERE id=?',(tid,)).fetchone()),True
+
+    async def post_turn(self,sid,payload,request_id):
+        turn,start=self.accept_turn(sid,payload)
+        if start:
+            task=asyncio.create_task(self.run_turn(turn,request_id))
+            self.tasks.add(task)
+            task.add_done_callback(self.tasks.discard)
+            await asyncio.wait({task},timeout=self.settings.sync_wait_seconds)
+        result=self.get_turn(sid,turn['id'],request_id)
+        if result['status']=='failed':
+            error=result['error']
+            raise APIError(503 if error['retryable'] else 500,error['code'],error['message'],error['retryable'])
+        return result
+
+    def get_turn(self,sid,tid,request_id):
+        with self.db.transaction() as c:
+            self.recover(c,sid)
+            row=c.execute('SELECT * FROM turns WHERE id=? AND session_id=?',(tid,sid)).fetchone()
+        if not row:
+            raise APIError(404,'TURN_NOT_FOUND','Запрос не найден.')
+        if row['status']=='completed':
+            return json.loads(row['response_json'])
+        if row['status']=='processing':
+            return {'turn_id':tid,'status':'processing','poll_after_ms':700}
+        return {'turn_id':tid,'status':'failed','error':{
+            'code':row['error_code'],'message':('Не удалось завершить ответ. Повторите запрос с тем же ключом.' if row['retryable'] else 'Ответ не прошел проверку. Уточните вопрос новым сообщением.'),
+            'request_id':request_id,'retryable':bool(row['retryable']),'details':{}}}
+
+    async def run_turn(self,turn,request_id):
+        started=time.perf_counter()
+        sid,tid,attempt=turn['session_id'],turn['id'],turn['attempt']
+        try:
+            with self.db.read() as c:
+                session=self.session(c,sid)
+                messages=[dict(r) for r in c.execute('SELECT * FROM messages WHERE session_id=? ORDER BY seq',(sid,))]
+                draft=draft_view(c.execute('SELECT * FROM lead_drafts WHERE session_id=?',(sid,)).fetchone())
+                known_values=[r[0] for r in c.execute('SELECT value FROM contact_history WHERE session_id=?',(sid,))]
+            latest=next(m for m in messages if m['id']==turn['user_message_id'])
+            contact_flow=manager_requested(latest['text']) or (bool(extract_contacts(latest['text'])) and session['phase']=='collecting_contacts')
+            if contact_flow:
+                missing=draft['missing_fields']
+                labels={'full_name':'ФИО','phone':'телефон','company':'название компании'}
+                answer=('Для заявки укажите '+', '.join(labels[k] for k in missing)+'. Перед сохранением покажу резюме для подтверждения.' if missing else 'Контакты заполнены. Проверьте резюме заявки и подтвердите сохранение в форме.')
+                result=ConsultationResult(kind='clarify',answer_text=answer,reason_code='contact_request')
+                decision={'kind':'collecting_contacts','reason_code':'contact_request'}
+                phase='collecting_contacts'
+            else:
+                request=ConsultationRequest(request_id=request_id,session_id=sid,user_message_id=latest['id'],
+                    latest_user_text=redact(latest['text'],draft,known_values),
+                    messages=[{'id':m['id'],'role':m['role'],'text':redact(m['text'],draft,known_values)} for m in messages],
+                    current_phase=session['phase'],corpus_version=self.core.corpus_version,
+                    timeout_budget_ms=int(self.settings.ml_timeout_seconds*1000))
+                result=await asyncio.wait_for(self.core.consult(request),timeout=self.settings.ml_timeout_seconds)
+                result=ConsultationResult.model_validate(result)
+                if result.kind=='answer' and not result.evidence:
+                    raise InvalidEvidence('Missing evidence')
+                # Independently revalidate source membership before persistence.
+                self.core.validate_result(result)
+                decision={'kind':result.kind,'reason_code':result.reason_code}
+                phase='clarification' if result.kind=='clarify' else 'consulting'
+            elapsed=(time.perf_counter()-started)*1000
+            with self.db.transaction() as c:
+                current=c.execute('SELECT * FROM turns WHERE id=?',(tid,)).fetchone()
+                # Attempt/lease fence: a late worker can never append after recovery.
+                if current['status']!='processing' or current['attempt']!=attempt or current['lease_until']<=time.time():
+                    return
+                assistant=self.append_message(c,sid,'assistant',result.answer_text)
+                c.execute('UPDATE sessions SET phase=?,revision=revision+1 WHERE id=?',(phase,sid))
+                trace={'assistant_message_id':assistant['id'],'retrieval_query':result.retrieval_query,'decision':decision,
+                    'source_ids':list(dict.fromkeys(e.document_id for e in result.evidence)),
+                    'evidence':[e.model_dump() for e in result.evidence],'timings_ms':result.timings_ms,
+                    'corpus_version':self.core.corpus_version,'latency_ms':round(elapsed,3),
+                    'model_metadata':result.model_metadata,
+                    'recommended_products':result.recommended_products}
+                c.execute('INSERT INTO answer_traces VALUES (?,?,?)',(assistant['id'],sid,packed(trace)))
+                response={'turn_id':tid,'status':'completed','session':self.session(c,sid),
+                    'user_message':public_message(latest),'assistant_message':assistant,'decision':decision,
+                    'lead_draft':draft if contact_flow else None}
+                c.execute("UPDATE turns SET status='completed',assistant_message_id=?,response_json=?,lease_until=NULL WHERE id=?",(assistant['id'],packed(response),tid))
+        except asyncio.CancelledError:
+            self.fail_turn(tid,attempt,'INTERRUPTED',True)
+            raise
+        except CorpusNotReady:
+            self.fail_turn(tid,attempt,'KNOWLEDGE_NOT_READY',True)
+        except (ConsultationUnavailable,TimeoutError):
+            self.fail_turn(tid,attempt,'MODEL_UNAVAILABLE',True)
+        except InvalidEvidence:
+            self.fail_turn(tid,attempt,'INVALID_EVIDENCE',False)
+        except Exception:
+            # Never disclose prompt contents, provider responses, DB paths, or PII.
+            self.fail_turn(tid,attempt,'INTERNAL_ERROR',True)
+
+    def fail_turn(self,tid,attempt,code,retryable):
+        try:
+            with self.db.transaction() as c:
+                c.execute("UPDATE turns SET status='failed',error_code=?,retryable=?,lease_until=NULL WHERE id=? AND attempt=? AND status='processing'",(code,int(retryable),tid,attempt))
+        except sqlite3.Error:
+            # Lease recovery remains available after the storage failure clears.
+            pass
+
+    def preview(self,sid):
+        with self.db.transaction() as c:
+            self.active(c,sid)
+            self.idle(c,sid)
+            draft=draft_view(c.execute('SELECT * FROM lead_drafts WHERE session_id=?',(sid,)).fetchone())
+            messages=[dict(r) for r in c.execute('SELECT * FROM messages WHERE session_id=? ORDER BY seq',(sid,))]
+            known_values=[r[0] for r in c.execute('SELECT value FROM contact_history WHERE session_id=?',(sid,))]
+            customer=[redact(m['text'],draft,known_values) for m in messages if m['role']=='user']
+            customer=[s for s in customer if self.substantive(s)]
+            # An extractive synopsis preserves correction order without inventing facts.
+            excerpt=customer[-6:]
+            summary=('Последние сведения клиента (поздние исправления имеют приоритет):\n'+'\n'.join(f'— {s[:400]}' + ('…' if len(s)>400 else '') for s in excerpt)) if excerpt else 'Клиент оставляет заявку. Задача пока не описана.'
+            if len(customer)>6:
+                summary+='\nБолее ранние сведения сохранены в истории диалога.'
+            traces=[json.loads(r[0]) for r in c.execute('SELECT t.payload_json FROM answer_traces t JOIN messages m ON m.id=t.assistant_message_id WHERE t.session_id=? ORDER BY m.seq',(sid,))]
+            products=list(dict.fromkeys(p for trace in traces for p in trace.get('recommended_products',[])))
+            last_trace=traces[-1] if traces else None
+            questions=[messages[-1]['text']] if last_trace and last_trace['decision']['kind']=='clarify' and messages[-1]['role']=='assistant' else []
+            preview={'preview_id':uid(),'snapshot_last_seq':messages[-1]['seq'],'draft_revision':draft['revision'],
+                     **{k:draft[k] for k in ('status','missing_fields','full_name','phone','company')},
+                     'can_confirm':bool(draft['phone']),'client_problem':' / '.join(s[:300] for s in customer[-3:]),
+                     'summary':summary,'facts':[],'recommended_products':products,'open_questions':questions}
+            c.execute('INSERT INTO lead_previews VALUES (?,?,?,?,?,?)',(preview['preview_id'],sid,preview['snapshot_last_seq'],draft['revision'],packed(preview),now()))
+            c.execute("UPDATE sessions SET phase='reviewing_lead',revision=revision+1 WHERE id=?",(sid,))
+        return preview
+
+    @staticmethod
+    def substantive(text):
+        stripped=re.sub(r'\[[^]]+\]','',text).strip(' ,.!?:;')
+        return bool(stripped) and not re.fullmatch(r'(?:привет|здравствуйте|добрый день|спасибо|да|нет)',stripped,re.I) and not manager_requested(stripped)
+
+    def confirm(self,sid,payload):
+        key,pid=str(payload.idempotency_key),str(payload.preview_id)
+        with self.db.transaction() as c:
+            old=c.execute('SELECT * FROM leads WHERE session_id=? AND idempotency_key=?',(sid,key)).fetchone()
+            if old:
+                if old['preview_id']!=pid:
+                    raise APIError(409,'IDEMPOTENCY_CONFLICT','Этот ключ уже использован для другого превью.')
+                return {'lead':json.loads(old['payload_json']),'message':'Заявка сохранена в демонстрационном прототипе.'},False
+            self.active(c,sid)
+            self.idle(c,sid)
+            row=c.execute('SELECT * FROM lead_previews WHERE id=? AND session_id=?',(pid,sid)).fetchone()
+            if not row:
+                raise APIError(404,'PREVIEW_NOT_FOUND','Предпросмотр не найден.')
+            if c.execute('SELECT 1 FROM leads WHERE preview_id=?',(pid,)).fetchone():
+                raise APIError(409,'PREVIEW_ALREADY_CONFIRMED','Это превью уже подтверждено.')
+            draft=c.execute('SELECT * FROM lead_drafts WHERE session_id=?',(sid,)).fetchone()
+            last=c.execute('SELECT MAX(seq) FROM messages WHERE session_id=?',(sid,)).fetchone()[0]
+            if last!=row['snapshot_last_seq'] or draft['revision']!=row['draft_revision']:
+                raise APIError(409,'PREVIEW_STALE','Переписка или контакты изменились. Обновите предпросмотр.')
+            snapshot=json.loads(row['snapshot_json'])
+            if not snapshot['can_confirm']:
+                raise APIError(422,'CONTACT_REQUIRED','Для заявки нужен телефон. Черновик сохранен.')
+            stamp=now()
+            lead={k:v for k,v in snapshot.items() if k not in ('preview_id','snapshot_last_seq','draft_revision','can_confirm')}
+            lead.update(id=uid(),session_id=sid,created_at=stamp,confirmed_at=stamp)
+            c.execute('INSERT INTO leads VALUES (?,?,?,?,?,?,?,?)',(lead['id'],sid,pid,key,lead['status'],lead['phone'],packed(lead),stamp))
+            c.execute("UPDATE sessions SET phase='lead_saved',revision=revision+1 WHERE id=?",(sid,))
+        return {'lead':lead,'message':'Заявка сохранена в демонстрационном прототипе.'},True
+
+    def review_sessions(self,offset,limit):
+        with self.db.read() as c:
+            rows=c.execute('SELECT * FROM sessions ORDER BY opened_at,id LIMIT ? OFFSET ?',(limit+1,offset)).fetchall()
+        return {'items':[public_session(r) for r in rows[:limit]],'next_offset':offset+limit if len(rows)>limit else None}
+
+    def review_session(self,sid):
+        with self.db.read() as c:
+            session=self.session(c,sid)
+            messages=[public_message(r) for r in c.execute('SELECT * FROM messages WHERE session_id=? ORDER BY seq',(sid,))]
+            draft=draft_view(c.execute('SELECT * FROM lead_drafts WHERE session_id=?',(sid,)).fetchone())
+            leads=[json.loads(r[0]) for r in c.execute('SELECT payload_json FROM leads WHERE session_id=? ORDER BY created_at,id',(sid,))]
+        return {'session':session,'messages':messages,'draft':draft,'leads':leads}
+
+    def review_leads(self,offset,limit):
+        with self.db.read() as c:
+            rows=c.execute('''SELECT 'confirmed' AS record_type, id AS record_id, session_id, created_at AS stamp FROM leads
+              UNION ALL SELECT 'draft', session_id, session_id, updated_at FROM lead_drafts
+              ORDER BY stamp,record_id,record_type LIMIT ? OFFSET ?''',(limit+1,offset)).fetchall()
+            items=[]
+            for r in rows[:limit]:
+                if r['record_type']=='confirmed':
+                    obj=json.loads(c.execute('SELECT payload_json FROM leads WHERE id=?',(r['record_id'],)).fetchone()[0])
+                else:
+                    obj=draft_view(c.execute('SELECT * FROM lead_drafts WHERE session_id=?',(r['session_id'],)).fetchone())
+                    obj['session_id']=r['session_id']
+                items.append({'record_type':r['record_type'],**obj})
+        return {'items':items,'next_offset':offset+limit if len(rows)>limit else None}
+
+    def review_lead(self,lid):
+        with self.db.read() as c:
+            row=c.execute('SELECT payload_json FROM leads WHERE id=?',(lid,)).fetchone()
+        if not row:
+            raise APIError(404,'LEAD_NOT_FOUND','Заявка не найдена.')
+        return {'lead':json.loads(row[0])}
+
+    def trace(self,mid):
+        with self.db.read() as c:
+            row=c.execute('SELECT payload_json FROM answer_traces WHERE assistant_message_id=?',(mid,)).fetchone()
+        if not row:
+            raise APIError(404,'TRACE_NOT_FOUND','Трассировка не найдена.')
+        return json.loads(row[0])

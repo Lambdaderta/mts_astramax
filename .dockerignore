@@ -1,0 +1,16 @@
+.git
+.env
+.env.*
+!.env.example
+.venv
+__pycache__
+.pytest_cache
+*.pyc
+*.db*
+*.sqlite*
+data
+private
+work
+dist
+*.zip
+submission.csv

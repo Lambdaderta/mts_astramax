@@ -1,0 +1,1 @@
+"""Energytool backend prototype."""

@@ -1,0 +1,43 @@
+services:
+  api:
+    build: .
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      DATABASE_PATH: /data/energytool.db
+      INDEX_DIR: /private/index
+      REVIEW_TOKEN: ${REVIEW_TOKEN:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+      ML_TIMEOUT_SECONDS: ${ML_TIMEOUT_SECONDS:-10}
+      TURN_LEASE_SECONDS: ${TURN_LEASE_SECONDS:-30}
+      SYNC_WAIT_SECONDS: ${SYNC_WAIT_SECONDS:-0.5}
+      REQUESTS_PER_MINUTE: ${REQUESTS_PER_MINUTE:-120}
+      LLM_ENABLED: ${LLM_ENABLED:-false}
+      ALLOW_PRIVATE_CORPUS_TO_LLM: ${ALLOW_PRIVATE_CORPUS_TO_LLM:-false}
+      LLM_ALLOW_PRIVATE_CORPUS: ${LLM_ALLOW_PRIVATE_CORPUS:-false}
+      LLM_ALLOW_INTERNAL_HTTP: ${LLM_ALLOW_INTERNAL_HTTP:-false}
+      LLM_GENERATION_MODE: ${LLM_GENERATION_MODE:-grounded}
+      LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-2}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
+      GEN_MODEL: ${GEN_MODEL:-}
+      TEMPERATURE: ${TEMPERATURE:-0}
+      MAX_TOKENS: ${MAX_TOKENS:-2048}
+    volumes:
+      - energytool_data:/data
+      - type: bind
+        source: ${INDEX_DIR_HOST:-./private/index}
+        target: /private/index
+        read_only: true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live', timeout=2)"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+volumes:
+  energytool_data:
