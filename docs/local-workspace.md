@@ -1,18 +1,24 @@
-# Prepared local workspace
+# Local setup with an authorized corpus
 
-This note applies only to the workspace where this implementation was created. Portable setup is in the README. Downloaded organizer material remains outside the distributable source directory.
+Set up `.venv` as shown in the README. Keep the issued archive and demo questions in a private directory with owner-only access. The platform expects the demo question file under the name `questions.csv` when running the adapter locally.
 
-From this project's directory:
+Run the API with an index built from the extracted corpus.
 
 ```bash
-# Run using the existing virtual environment and the privately built real index.
-DATABASE_PATH=../../work/local.db \
-INDEX_DIR=../../work/private/index \
-../../work/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --no-access-log
+.venv/bin/python scripts/ingest.py \
+  --corpus-dir /path/to/private/corpus \
+  --index-dir /path/to/private/index
+
+INDEX_DIR=/path/to/private/index \
+  .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --no-access-log
 ```
 
-The prepared environment is `../../work/venv`. Organizer downloads are in `../../work/organizer`; the extracted corpus and index are in `../../work/private`. The technical regulation was retrieved into `../../work/regulation.txt`. These paths are relative to the project directory and are not shipped in the source ZIP.
+With Docker, set `INDEX_DIR_HOST` to the index directory. Index files are written with owner-only permissions. On a Linux bind mount, grant the container user (UID 10001) read access to the index and traversal access to the mounted directory through ownership or a file ACL. Keep the mount read-only.
 
-The index contains the real supplied corpus and is available for local testing. External model calls remain disabled unless explicitly configured. No model credentials were obtained or used. The temporary smoke-test server was stopped after verification.
+For a local file-format check, point the platform adapter at the directory holding `questions.csv` and `knowledge-base.zip`. The offline run uses the lexical baseline and writes a private output file.
 
-The organizer's sample question filename is `demo_questions.csv`; the platform expects `questions.csv`. To run the official adapter locally, prepare a private input directory with the expected filenames. Do not commit that input directory or its resulting answers.
+```bash
+.venv/bin/python solution.py --offline \
+  --data-dir /path/to/private/inputs \
+  --output /path/to/private/inputs/submission.csv
+```

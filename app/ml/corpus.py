@@ -10,7 +10,10 @@ import hashlib
 import json
 import re
 from dataclasses import asdict, dataclass
+from functools import cached_property
+from io import BytesIO
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 from .protocol import CorpusNotReady
@@ -52,7 +55,7 @@ class Corpus:
     documents: tuple[Document, ...]
     chunks: tuple[Chunk, ...]
 
-    @property
+    @cached_property
     def chunks_by_id(self) -> dict[str, Chunk]:
         return {chunk.chunk_id: chunk for chunk in self.chunks}
 
@@ -68,9 +71,11 @@ class Corpus:
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / "index.json"
-        temporary = directory / "index.json.tmp"
-        temporary.write_text(canonical_json({**self.payload(), "corpus_version": self.version}) + "\n", encoding="utf-8")
-        temporary.replace(path)
+        with TemporaryDirectory(prefix=".index-", dir=directory) as staging:
+            temporary = Path(staging) / path.name
+            temporary.write_text(canonical_json({**self.payload(), "corpus_version": self.version}) + "\n", encoding="utf-8")
+            temporary.chmod(0o600)
+            temporary.replace(path)
         return path
 
     @classmethod
@@ -78,6 +83,8 @@ class Corpus:
         path = Path(directory) / "index.json"
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError("Index must be a JSON object")
             if raw.get("format_version") != FORMAT_VERSION or raw.get("chunk_word_target") != CHUNK_WORD_TARGET:
                 raise ValueError("Unsupported corpus format or chunking configuration")
             corpus = cls(
@@ -89,16 +96,23 @@ class Corpus:
                 raise ValueError("Empty corpus")
             if sha256(canonical_json(corpus.payload())) != corpus.version:
                 raise ValueError("Corpus checksum mismatch")
+            for document in corpus.documents:
+                if not all(isinstance(field, str) for field in (document.document_id, document.title, document.source, document.checksum)):
+                    raise ValueError("Invalid document metadata")
             document_ids = {item.document_id for item in corpus.documents}
             if len(document_ids) != len(corpus.documents):
                 raise ValueError("Duplicate document IDs")
-            if len(corpus.chunks_by_id) != len(corpus.chunks):
-                raise ValueError("Duplicate chunk IDs")
             for chunk in corpus.chunks:
+                if not all(isinstance(field, str) for field in (chunk.chunk_id, chunk.document_id, chunk.title, chunk.text, chunk.checksum)):
+                    raise ValueError("Invalid chunk metadata")
+                if chunk.page is not None and (type(chunk.page) is not int or chunk.page < 1):
+                    raise ValueError("Invalid chunk page")
                 if chunk.document_id not in document_ids or sha256(chunk.text) != chunk.checksum or not chunk.text.strip():
                     raise ValueError("Invalid chunk reference or checksum")
+            if len(corpus.chunks_by_id) != len(corpus.chunks):
+                raise ValueError("Duplicate chunk IDs")
             return corpus
-        except (OSError, ValueError, TypeError, KeyError) as exc:
+        except (OSError, ValueError, TypeError, KeyError, RecursionError) as exc:
             raise CorpusNotReady("Local corpus index is missing or invalid; run the ingest command.") from exc
 
 
@@ -113,7 +127,7 @@ def _paragraph_chunks(text: str) -> list[str]:
         # Keep following qualifications/footnotes with the preceding statement,
         # even when that creates an oversized chunk requiring manual review.
         is_qualification = bool(re.match(
-            r"(?:услов|огранич|примечан|только|при\b|кроме|за исключен|не\b|\*|\[\d+\])",
+            r"(?:услов|огранич|примечан|только|если\b|при\b|кроме|за исключен|не\b|иначе\b|\*|\[\^?\d+\])",
             paragraph, re.IGNORECASE,
         ))
         if pending and word_count + words > CHUNK_WORD_TARGET and not is_qualification:
@@ -150,16 +164,16 @@ def _markdown_units(text: str, default_title: str) -> list[tuple[str, str, int |
     return units
 
 
-def _read_units(path: Path) -> list[tuple[str, str, int | None]]:
+def _read_units(path: Path, data: bytes) -> list[tuple[str, str, int | None]]:
     suffix = path.suffix.lower()
     if suffix == ".pdf":
         from pypdf import PdfReader
-        reader = PdfReader(path)
+        reader = PdfReader(BytesIO(data))
         units = [(path.stem, page.extract_text() or "", number) for number, page in enumerate(reader.pages, 1)]
         if any(not text.strip() for _, text, _ in units):
             raise ValueError(f"PDF {path.name} has a page without extractable text; OCR/manual review is required")
         return units
-    text = path.read_text(encoding="utf-8-sig")
+    text = data.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
     if suffix == ".md":
         return _markdown_units(text, path.stem)
     if suffix == ".txt":
@@ -190,12 +204,14 @@ def ingest(corpus_directory: str | Path) -> Corpus:
     for path in sorted(root.rglob("*")):
         if not path.is_file() or path.suffix.lower() not in SUPPORTED_SUFFIXES:
             continue
-        if root not in path.resolve().parents:
+        resolved = path.resolve()
+        if root not in resolved.parents:
             raise ValueError("Corpus symlinks must not escape the supplied directory")
         source = path.relative_to(root).as_posix()
-        checksum = sha256(path.read_bytes())
+        data = resolved.read_bytes()
+        checksum = sha256(data)
         document_id = "doc_" + sha256(source)[:24]
-        units = _read_units(path)
+        units = _read_units(path, data)
         documents.append(Document(document_id, path.stem, source, checksum))
         ordinal = 0
         for title, text, page in units:

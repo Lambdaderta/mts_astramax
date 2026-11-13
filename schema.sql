@@ -1,4 +1,5 @@
--- Locally reconstructed from the supplied prose. Migration 1, additive only.
+-- Idempotent schema for fresh databases and additive upgrades from version 1.
+BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS sessions (
  id TEXT PRIMARY KEY, token_hash TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('active','closed')),
  phase TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1, opened_at TEXT NOT NULL, closed_at TEXT
@@ -40,4 +41,12 @@ CREATE TABLE IF NOT EXISTS answer_traces (
 );
 CREATE INDEX IF NOT EXISTS sessions_opened ON sessions(opened_at,id);
 CREATE INDEX IF NOT EXISTS leads_created ON leads(created_at,id);
-PRAGMA user_version=1;
+CREATE TABLE IF NOT EXISTS facts (
+ id INTEGER PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
+ topic_key TEXT NOT NULL, fact_key TEXT NOT NULL, value_json TEXT NOT NULL,
+ source_message_id TEXT NOT NULL REFERENCES messages(id), superseded_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS one_current_fact
+ ON facts(session_id,topic_key,fact_key) WHERE superseded_at IS NULL;
+PRAGMA user_version=2;
+COMMIT;

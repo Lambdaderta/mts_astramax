@@ -13,8 +13,8 @@ from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 
 ROOT = Path(__file__).resolve().parents[1]
-# Both versions are in the organizer's recovered allowed requirements.txt.
-PLATFORM_REQUIREMENTS = "pydantic==2.14.2\npypdf==6.21.4\n"
+# These versions are in the organizer's allowed requirements.txt.
+PLATFORM_REQUIREMENTS = "httpx==0.28.1\npydantic==2.14.2\npypdf==6.21.4\n"
 
 
 class RootImports(ast.NodeTransformer):
@@ -33,6 +33,8 @@ class RootImports(ast.NodeTransformer):
             if suffix not in self.modules:
                 raise ValueError(f"Unknown ML module: {suffix}")
             node.module = "energytool_ml_" + suffix
+        elif module == "app.privacy":
+            node.module = "energytool_privacy"
         elif module == "app" or module.startswith("app."):
             raise ValueError("Submission must not depend on the web application")
         return node
@@ -60,6 +62,7 @@ def build_submission(output: Path, *, root: Path = ROOT) -> list[str]:
         raise ValueError("Shared consultation core is incomplete")
     files = {
         "solution.py": flattened_source(root / "solution.py", modules, source_is_ml=False),
+        "energytool_privacy.py": flattened_source(root / "app" / "privacy.py", modules, source_is_ml=False),
         "requirements.txt": PLATFORM_REQUIREMENTS,
     }
     for path in sources:

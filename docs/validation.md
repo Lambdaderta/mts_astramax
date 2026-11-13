@@ -1,56 +1,39 @@
-# Validation record
+# Проверка бэкенда Energytool · 13 ноября 2026
 
-Executed on 12 November 2026, Python 3.12.14, using the pinned local environment. These results establish implementation behavior, not competition acceptance or live model quality.
+Проверены локальные изменения поверх `537697d` по исходному кейсу МТС, QA-сводке и командной спецификации Backend Engineering Contract v1. Формат автопроверки сверен с [письменным регламентом организаторов](https://docs.google.com/document/d/1wZsqH4xXZXwjiAJCtFQGjTaLxEU3D_tMCSw0yXcbQ0U/edit), демонстрационными файлами и примером сабмита.
 
-## Executed checks
+## Результаты
 
-| Check | Result | Scope |
+| Проверка | Результат | Объём проверки |
 | --- | --- | --- |
-| `python -m pytest -q --tb=short` | **96 passed**, 3.02 seconds; one upstream Starlette/AnyIO deprecation warning | Backend, HTTP contract/security boundaries, ML, privacy regressions and platform packaging |
-| Backend integration scenarios | 30 passed within the suite | Session isolation; token hashes; duplicate/retry conflicts; one processing turn across application instances; timeouts; stale leases; idempotent partial/full leads; stale previews; restart persistence; forced SQLite response-commit failure |
-| Independent review regressions | 8 passed within the suite | Historical contact redaction through correction, clearing and restart; contact-label parsing; trace model metadata; synopsis correction order; accepted 4000-character text after redaction |
-| ML tests | 36 passed within the suite | Corpus/checksum integrity; source validation; scope and missing knowledge; injection examples; generated non-answer bypasses; numeric magnitude/currency/unit changes; economic guarantees; conflicting prices; 31-turn history budget; preservation of business quantities |
-| Platform adapter tests | 17 passed within the suite | CSV quoting/IDs/limits; fresh context per row; archive traversal/link/size checks; atomic output; clean-directory packed execution; actual HTTP requests to temporary localhost fake proxies |
-| HTTP boundary and contract tests | 5 passed within the suite | Body size, sanitized validation errors, rate limiting, CORS/review defaults, explicit model configuration and generated OpenAPI consistency |
-| Real Uvicorn HTTP smoke | Passed | Created session, requested manager, filled synthetic contacts, previewed/confirmed lead, safely retried confirmation, read history and closed session; server stopped afterward |
-| `/health/ready` with real local index | 200 | SQLite and the loaded local corpus were available; no external model health or quality claim |
-| Python `compileall` | Passed | Application, scripts, entrypoint and ML contract |
-| Generated frontend TypeScript syntax | Parsed successfully by Node 24's `--experimental-strip-types` | Syntax check only; no TypeScript compiler/type-checker run |
-| `docker compose config --quiet` | Passed | Configuration validity only |
-| Container image build/restart | **Not run** | Docker client exists, but no Docker daemon/socket is running on this machine |
+| `python -m pytest -q --tb=short`, локальный Python 3.13.5 | **164 passed**, 3.66 с | API, SQLite, контакты и приватность, источники, таймауты, пакет автопроверки и тестовый HTTP-прокси |
+| Тот же набор в Docker, Python 3.12.13 | **164 passed**, 4.33 с | Целевая версия Python, зависимости из `requirements.lock` |
+| Тесты исходного `537697d` на Python 3.13.5 | 95 passed, 1 failed | Описания HTTP 413 и 422 зависели от версии Python. В приложении закреплены прежние описания. Сохранённый OpenAPI совпадает с генерируемым |
+| `docker compose config`, сборка и запуск | Пройдены | Локальный контейнер и приватный индекс, `/health/live` и `/health/ready` вернули 200 |
+| `scripts/smoke.py` и пересоздание контейнера | Пройдены | Запрос менеджера, полная заявка, повтор подтверждения, история и закрытие. После пересоздания найдены прежняя заявка, 17 сообщений и защищённая трассировка. Новый чат начался с приветствия |
+| Две параллельные сессии по HTTP | Пройдено | Токен одной сессии не читает другую. История каждой содержит только её сообщения |
+| `solution.py` из распакованного ZIP | **18 из 18** корректных CSV-строк | Реальные демовопросы, локальный режим, исходные ID и порядок, непустые ответы. В ZIP десять корневых файлов. Три зависимости сверены с разрешённым списком |
+| `compileall`, `ruff check --select F`, `git diff --check` | Пройдены | Код приложения, скрипты, тесты, точка входа и ML-контракт |
 
-The complete suite used the exact runtime dependency versions recorded in `requirements.lock`, with test tools in `requirements-dev.txt`. Local fake-server tests need permission to bind loopback sockets in restrictive execution environments. No real model or external inference endpoint was called.
+В обоих прогонах pytest присутствует предупреждение Starlette о будущем удалении устаревшего алиаса AnyIO.
 
-## Real corpus and demo data
+## Сессии, заявки и хранение
 
-The organizer's issued archive was retrieved through the link in the original case and processed locally. It contains **19 Markdown documents**, producing **249 section-aware chunks**. Corpus version:
+Регрессии покрывают миграцию SQLite v1→v2 с сохранением истории, восстановление после истёкшего lease, запрет записи ответа просроченным обработчиком и опрос во время параллельной записи. Отдельно проверены сбой провайдера и повтор с тем же ключом, изоляция сессий, безопасная трассировка при отклонении доказательства, корректные ответы readiness при повреждённой схеме и `400` при невалидном JSON.
 
-```text
-1e8e2243767886442ddcd2c6ad01e8da3b32063861ece0abc26bf3d014ab0d34
-```
+В заявках проверены прямой запрос специалиста, полный и частичный контакт, неподтверждаемый черновик без телефона, устаревший снимок и повторное подтверждение. В предпросмотре сохраняются задача из смешанной реплики, актуальные явно указанные количества приборов и последний открытый вопрос. Коррекции количеств привязаны к сообщениям и хранятся по ресурсу. Остальные бизнес-факты пока доступны через ограниченную историю и текст резюме.
 
-The private corpus, index, demonstration questions and generated answers are outside the source deliverable and both ZIPs.
+## Проверка корпуса и времени ответа
 
-A local top-five retrieval inspection found the expected **broad-topic document for all 18 demo questions**. The diagnostic was based on expected document topics, not annotated relevant chunks or claim-level answer support. It is not Recall@5, an accuracy percentage, or a judge score. Generic Russian normalization/synonyms were adjusted using these public demonstration examples; a held-out evaluation is still needed.
+Выданный архив обработан локально. Из **19 документов** получено **248 фрагментов**. В пяти диалоговых демокейсах поиск теперь учитывает предыдущие реплики пользователя. В исходной версии из пяти случаев предыдущая реплика не участвовала ни в одном. Состав пяти первых документов изменился в 15 из 18 запросов. Это сравнение результатов поиска без разметки релевантности.
 
-Running the real demo questions through the final offline core gave:
+Автономный режим на 18 демокейсах вернул один ответ с источником, одно уточнение и 16 ответов о недостатке сведений. Этот результат совпал с исходной версией. Зафиксирован формат CSV и работа поиска, а качество полноценной консультации ещё требует прогона через модель.
 
-| Decision | Count |
-| --- | ---: |
-| Sourced excerpt answer | 1 |
-| Clarification | 1 |
-| Insufficient knowledge / conservative abstention | 16 |
+На прогретом контейнере измерено **36 последовательных HTTP-реплик** с локальным BM25 и SQLite. Медиана **10,26 мс**, p95 **23,44 мс** по методу ближайшего ранга. Запросы включали пользовательские реплики из демовопросов и синтетические сценарии уточнения, смены темы, передачи специалисту и выхода за область консультации. Замер охватывает локальный HTTP и хранение. Время загрузки холодного контейнера и вызовы Qwen в него не входят.
 
-Local sequential median processing was 0.290 ms and maximum 0.835 ms with the index already loaded. These numbers concern the tiny local lexical baseline, exclude model/API work, and must not be compared to full-consultation latency goals. The result demonstrates that retrieval can find relevant topics while the strict offline evidence gate under-answers the consultation task.
+## Что ещё требует проверки
 
-The official CSV adapter also processed the real archive and all 18 demo questions in explicit offline mode, producing 18 unique nonempty output rows. This validates file/format handling only. Local fake proxies validate request structure and package execution; they do not establish compatibility with live Qwen behavior.
-
-## Unverified and intentionally incomplete
-
-- Live organizer Qwen responses, token/rate behavior, numerical and semantic correctness, product recommendation quality and end-to-end latency.
-- Real generated answers on the demo set, a held-out corpus evaluation, and organizer-platform execution or score.
-- Full topic/fact correction reasoning beyond bounded chronological history. Current manager notes are extractive and structured facts/product lists are not inferred.
-- Dense embeddings and reranking. They remain optional optimizations to compare with the measured lexical baseline.
-- Full AT-01…AT-20 acceptance, frontend integration, chat/debug UI, deployment and final competition eligibility.
-
-Source checks prove where quotations came from. They cannot prove that generated prose preserves every qualifier, negation and applicability condition. Conflict detection is intentionally conservative and may abstain for different products with different prices until an authoritative source-priority rule and applicability logic are supplied.
+- Ответы и задержка Qwen на прокси организаторов, лимиты сервиса и балл платформы. Тестовый прокси покрывает HTTP-контракт, сетевые ошибки и ограничение общего времени ответа.
+- Корректность выбора продукта, разрешение противоречий между источниками и перенос условий между документами. Проверка текста требует близкой формулировки из источника и может отклонять допустимые перефразировки.
+- Совместимость с уже реализованным фронтендом, если у команды есть отдельная исходная версия контрактов. Текущие схемы API проверены по коду, полная приёмка AT-01–AT-20 требует интерфейса и доступа к модели.
+- Сбор счётчиков и распределений в среде развёртывания. Бэкенд пишет структурированные события со стадиями и временем, отдельный сборщик метрик не подключён.

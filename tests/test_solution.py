@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import csv
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import io
 import json
 import os
 from pathlib import Path
@@ -21,9 +20,10 @@ from scripts.build_submission import build_submission, PLATFORM_REQUIREMENTS
 import solution
 
 
+SYNTHETIC_CLAIM = "Учебный маяк собирает показания учебных датчиков."
 SYNTHETIC = (
     "Учебный маяк — вымышленный продукт для автоматического теста. "
-    "Учебный маяк собирает показания учебных датчиков. "
+    f"{SYNTHETIC_CLAIM} "
     "Учебные датчики передают показания один раз в сутки. "
     "Эти сведения не относятся к реальным продуктам Energytool."
 )
@@ -99,6 +99,19 @@ def test_dialogue_parser_preserves_latest_user_and_fresh_ids():
     assert {message.id for message in first.messages}.isdisjoint({message.id for message in second.messages})
 
 
+def test_platform_dialogue_redacts_contact_values_across_history():
+    question = solution.Question('case', (
+        'Пользователь: Меня зовут Тестовый Клиент, телефон +7 (999) 000-00-00.\n'
+        'Ассистент: Чем помочь, Тестовый Клиент?\n'
+        'Пользователь: Измеряем расход для 12 объектов.'
+    ))
+    request = solution.consultation_request(question, 'synthetic', 1000)
+    history = '\n'.join(message.text for message in request.messages)
+    assert 'Тестовый Клиент' not in history
+    assert '999' not in history
+    assert '12 объектов' in request.latest_user_text
+
+
 def test_cases_never_share_context_and_output_order_is_stable():
     class RecordingCore:
         corpus_version = "synthetic"
@@ -124,6 +137,33 @@ def test_cases_never_share_context_and_output_order_is_stable():
     assert all(len(request.messages) == 1 for request in core.requests)
 
 
+def test_submission_budget_cancels_active_cases_and_leaves_fallbacks_for_queued_cases():
+    class BlockingCore:
+        corpus_version = 'synthetic'
+
+        def __init__(self):
+            self.active = 0
+            self.calls = 0
+
+        async def consult(self, request):
+            self.calls += 1
+            self.active += 1
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.active -= 1
+
+    core = BlockingCore()
+    questions = [solution.Question(str(index), 'Учебный вопрос') for index in range(12)]
+    answers, failures = asyncio.run(solution.answer_questions(
+        questions, core, workers=2, total_timeout_seconds=0.05,
+    ))
+    assert answers == [(question.id, solution.FAILURE_ANSWER) for question in questions]
+    assert failures == len(questions)
+    assert core.calls == 2
+    assert core.active == 0
+
+
 def test_platform_adapter_does_not_truncate_long_last_question():
     question = solution.Question("long", "я" * 4001)
     request = solution.consultation_request(question, "synthetic", 1000)
@@ -140,6 +180,20 @@ def test_malformed_dialogue_has_explicit_fallback():
     answers, failures = asyncio.run(solution.answer_questions([solution.Question("bad", "Ассистент: Только ответ без вопроса.")], NeverCalled()))
     assert answers == [("bad", solution.INVALID_QUESTION_ANSWER)]
     assert failures == 1
+
+
+def test_direct_manager_request_skips_model_without_claiming_lead_was_saved():
+    class NeverCalled:
+        corpus_version = 'synthetic'
+
+        async def consult(self, request):
+            raise AssertionError('A direct manager request must bypass the model')
+
+    question = solution.Question('handoff', 'Соедините меня с менеджером, пожалуйста.')
+    answers, failures = asyncio.run(solution.answer_questions([question], NeverCalled()))
+    assert answers == [('handoff', solution.CONTACT_REQUEST_ANSWER)]
+    assert 'телефон' in answers[0][1] and 'сохран' not in answers[0][1]
+    assert failures == 0
 
 
 @pytest.mark.parametrize("name", ["../escaped.md", "/absolute.md", "nested/../../escaped.md", "nested\\escaped.md", "C:/escaped.md"])
@@ -231,7 +285,7 @@ def fake_proxy():
             supplied = json.loads(body["messages"][-1]["content"])
             sources = supplied["SOURCE"]
             if sources:
-                model = {"kind": "answer", "answer_text": sources[0]["text"], "chunk_ids": [sources[0]["chunk_id"]]}
+                model = {"kind": "answer", "answer_text": SYNTHETIC_CLAIM, "chunk_ids": [sources[0]["chunk_id"]]}
             else:
                 model = {"kind": "insufficient_knowledge", "answer_text": "Нет сведений.", "chunk_ids": []}
             response = json.dumps({"choices": [{"message": {"content": json.dumps(model, ensure_ascii=False)}}]}, ensure_ascii=False).encode()
@@ -275,7 +329,7 @@ def test_packaged_official_csv_adapter_uses_model_aliases_and_independent_dialog
     assert "fallbacks=0" in process.stderr
     rows = csv_answers(runtime / "submission.csv")
     assert [row["id"] for row in rows] == ["single", "dialogue"]
-    assert all(row["answer"] == SYNTHETIC for row in rows)
+    assert all(row["answer"] == SYNTHETIC_CLAIM for row in rows)
     assert len(calls) == 2
     assert all(call["path"] == "/v1/chat/completions" for call in calls)
     assert all(call["auth"] == "Bearer synthetic-test-key" for call in calls)

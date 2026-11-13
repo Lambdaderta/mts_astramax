@@ -39,9 +39,12 @@ def create_app(settings: Settings | None = None, core: ConsultationCore | None =
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    responses={code:{'model':c.ErrorResponse} for code in (400,401,403,404,409,413,422,429,500,503)}
+    responses[413]['description']='Request Entity Too Large'
+    responses[422]['description']='Unprocessable Entity'
     app = FastAPI(title='MTS Energytool Backend', version='1.0.0', lifespan=lifespan,
                   description='Locally reconstructed team API. Product knowledge is supplied separately.',
-                  responses={code:{'model':c.ErrorResponse} for code in (400,401,403,404,409,413,422,429,500,503)})
+                  responses=responses)
     app.add_middleware(RequestGuard, settings=settings)
     app.add_middleware(CORSMiddleware, allow_origins=list(settings.cors_origins),
                        allow_methods=['GET','POST','PATCH','OPTIONS'],
@@ -68,22 +71,26 @@ def create_app(settings: Settings | None = None, core: ConsultationCore | None =
 
     @app.exception_handler(APIError)
     async def api_error(request, exc):
+        request.state.error_code=exc.code
         return JSONResponse(exc.body(request.state.request_id), status_code=exc.status)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request, exc):
         # Pydantic's raw errors can contain user input. Return field paths only.
+        if any(error['type'] == 'json_invalid' for error in exc.errors()):
+            error=APIError(400,'BAD_REQUEST','Тело запроса должно содержать корректный JSON.')
+            return await api_error(request,error)
         details={'fields':['.'.join(map(str,error['loc'])) for error in exc.errors()]}
         error=APIError(422,'VALIDATION_ERROR','Проверьте формат и обязательные поля.',details=details)
-        return JSONResponse(error.body(request.state.request_id),status_code=422)
+        return await api_error(request,error)
 
     @app.exception_handler(sqlite3.Error)
     async def storage_error(request, exc):
-        return JSONResponse(APIError(503,'STORAGE_UNAVAILABLE','Не удалось сохранить данные. Повторите запрос.',True).body(request.state.request_id),status_code=503)
+        return await api_error(request,APIError(503,'STORAGE_UNAVAILABLE','Не удалось сохранить данные. Повторите запрос.',True))
 
     @app.exception_handler(HTTPException)
     async def http_error(request, exc):
-        return JSONResponse(APIError(exc.status_code,'NOT_FOUND' if exc.status_code==404 else 'BAD_REQUEST','Запрос не поддерживается.').body(request.state.request_id),status_code=exc.status_code)
+        return await api_error(request,APIError(exc.status_code,'NOT_FOUND' if exc.status_code==404 else 'BAD_REQUEST','Запрос не поддерживается.'))
 
     @app.get('/health/live',tags=['health'])
     def live():
@@ -91,11 +98,14 @@ def create_app(settings: Settings | None = None, core: ConsultationCore | None =
 
     @app.get('/health/ready',response_model=c.Readiness,responses={503:{'model':c.Readiness}},tags=['health'])
     def ready(response: Response):
-        with svc().db.read() as conn:
-            conn.execute('SELECT 1').fetchone()
-        available=bool(svc().core.ready)
+        try:
+            database=svc().db.ready()
+        except sqlite3.Error:
+            database=False
+        knowledge=bool(svc().core.ready)
+        available=database and knowledge
         response.status_code=200 if available else 503
-        return {'status':'ready' if available else 'not_ready','database':True,'knowledge':available,
+        return {'status':'ready' if available else 'not_ready','database':database,'knowledge':knowledge,
                 'corpus_version':svc().core.corpus_version}
 
     @app.post('/api/v1/sessions',status_code=201,response_model=c.SessionCreated,tags=['sessions'])
@@ -108,8 +118,8 @@ def create_app(settings: Settings | None = None, core: ConsultationCore | None =
             return {'session':svc().session(conn,session_id)}
 
     @app.post('/api/v1/sessions/{session_id}/close',response_model=c.SessionResponse,tags=['sessions'])
-    def close(session_id: SessionID):
-        return svc().close_session(session_id)
+    def close(session_id: SessionID,request: Request):
+        return svc().close_session(session_id,request.state.request_id)
 
     @app.get('/api/v1/sessions/{session_id}/messages',response_model=c.MessagePage,tags=['sessions'])
     def messages(session_id: SessionID,after_seq: int=Query(0,ge=0),limit: int=Query(50,ge=1,le=200)):

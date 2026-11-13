@@ -23,7 +23,7 @@ Docker:
 docker compose up --build
 ```
 
-The API binds to localhost port 8000. SQLite lives in the `energytool_data` volume. The private index is mounted read-only from `./private/index` or `INDEX_DIR_HOST`. Without an index, session/contact workflows still work, `/health/ready` returns 503, and product questions receive an explicit knowledge-unavailable response. `/health/live` checks the running process. Docker Compose syntax was validated; container build/run was not verified because the local Docker daemon was unavailable.
+The API binds to localhost port 8000. SQLite lives in the `energytool_data` volume. The private index is mounted read-only from `./private/index` or `INDEX_DIR_HOST`. Without an index, session and contact workflows remain available, `/health/ready` returns 503, and product questions receive an explicit knowledge-unavailable response. `/health/live` checks the running process. See [validation results](docs/validation.md) for the container checks.
 
 To ingest an authorized local corpus:
 
@@ -33,7 +33,7 @@ python scripts/ingest.py --corpus-dir /path/to/private/corpus --index-dir privat
 
 Restart the API after rebuilding the index. Supported formats are Markdown, text, structured JSON/JSONL and text PDFs. The corpus and derived index contain private material: neither belongs in source control or either distributed ZIP. No real product knowledge is checked into this project.
 
-For this task's already prepared environment and private local index, see [local workspace instructions](docs/local-workspace.md).
+See [local workspace instructions](docs/local-workspace.md) for private mounts and offline evaluation.
 
 ## Modes and configuration
 
@@ -49,18 +49,19 @@ LLM_API_KEY=<provided at runtime>
 LLM_MODEL=<provided at runtime>
 ```
 
-The organizer supplies proxy credentials automatically on its platform; a personal key is not required there. Environment aliases `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL` and `GEN_MODEL` are supported by the shared client. The web API requires an explicit opt-in to transmit corpus excerpts. TLS is required except for localhost or explicitly enabled internal HTTP (`LLM_ALLOW_INTERNAL_HTTP=true`). Redirects are refused. Timeouts and transient retries are bounded. See `.env.example` for other settings.
+The organizer supplies proxy credentials automatically on its platform. Environment aliases `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL` and `GEN_MODEL` are supported by the shared client. The web API requires an explicit opt-in to transmit corpus excerpts. TLS is required except for localhost or explicitly enabled internal HTTP (`LLM_ALLOW_INTERNAL_HTTP=true`). Redirects are refused. A single wall-clock budget covers model transport, response reads and transient retries. See `.env.example` for other settings.
 
-Set a private `REVIEW_TOKEN` to enable `/api/v1/review/*`; an empty token disables access. Generate it locally, e.g. `python -c "import secrets; print(secrets.token_urlsafe(32))"`. It must never enter a public frontend bundle. `CORS_ORIGINS` allows explicit origins only. `REQUESTS_PER_MINUTE` is a per-process local rate limit, not a distributed gateway limit.
+Set a private `REVIEW_TOKEN` to enable `/api/v1/review/*`. An empty token disables access. Generate it locally with `python -c "import secrets; print(secrets.token_urlsafe(32))"` and keep it out of frontend builds. `CORS_ORIGINS` allows explicit origins only. `REQUESTS_PER_MINUTE` limits requests per client address within one process. `MAX_BODY_BYTES` bounds incoming HTTP request bodies.
 
 ## Implemented
 
 - FastAPI/Pydantic REST endpoints, Russian customer-facing messages, JSON errors and request IDs.
-- SQLite/WAL persistence with additive schema initialization, per-session bearer tokens stored only as hashes, isolated append-only histories and protected review access.
+- SQLite/WAL persistence with an additive v1-to-v2 migration, per-session bearer token hashes, isolated append-only histories and protected review access. Readiness verifies the database schema and index availability.
 - Durable turn acceptance, idempotent retries, asynchronous polling, one active turn per session enforced in SQLite, expiring leases and attempt fencing after a crashed worker. Failed model calls preserve the user message; failed response commits never report success.
 - Contacts entered through a versioned form or explicit chat labels; phone normalization; full and partial enquiries; persisted preview snapshots; stale-preview rejection; explicit idempotent confirmation. Saving is local, not delivery to a CRM or manager.
 - Historical explicit contact values remain redacted after correction or clearing. Raw history stays available only to the session owner and authorized review access. This is deterministic redaction, not a general PII detector.
-- A transport-independent consultation core, deterministic section-aware ingestion, corpus checksums, BM25 retrieval, measured stage timings and source traces. Model replies require known chunk IDs and verbatim evidence; numeric/unit and instruction checks reject several classes of unsupported claims.
+- Structured logs cover API responses, turn completion, model failures, retries, lead confirmations, and session closure. They carry operational IDs and durations. A log collector can aggregate the events and timing fields into counters and latency distributions.
+- A transport-independent consultation core, deterministic section-aware ingestion, corpus checksums, BM25 retrieval that uses relevant prior turns, measured stage timings and source traces. Grounded responses require short source-matching claims and relevant qualifications. Complete supporting evidence is available to authorized reviewers.
 - Official `solution.py` CSV processing with independent contexts, safe runtime ZIP extraction, bounded concurrency, atomic output and a deterministic root-only submission packager. The API and platform use the same core.
 
 ## API integration
@@ -116,8 +117,8 @@ See [validation results](docs/validation.md) for the exact executed checks and t
 
 ## Remaining work
 
-Live Qwen calls and actual answer quality/latency have not been verified. Structural citations and numeric checks cannot prove semantic entailment, preserve every condition automatically, or resolve arbitrary conflicting documents. The grounded path requires a real corpus-based evaluation before claiming reliable consultation.
+Live Qwen response quality and latency remain unverified. Claim validation is deliberately conservative and can reject valid paraphrases. Product applicability, conditions spread across documents and source precedence still need evaluation on the issued corpus.
 
-Dialogue reasoning is bounded-history based. There is no persistent semantic fact extractor, learned topic tracker, dense embedding search or reranker yet. Structured `fact_updates` and `recommended_products` stay empty; verbal model recommendations still require source-based review. Manager summaries are bounded extractive notes with correction order preserved, not model-written business summaries.
+Dialogue reasoning uses bounded history and stores explicit meter counts by resource with their source message. A later correction supersedes the previous value for that resource. General semantic facts, structured product recommendations, dense embedding search and model-based reranking remain open. Manager summaries use the latest substantive customer messages, retained facts and the latest outstanding consultation question when available.
 
 The chat frontend, presentation, deployment, CRM integration and competition upload were outside this backend/ML pass. [Integration questions](docs/integration-questions.md) lists the remaining external inputs; the most useful next step is a run against the organizer proxy, followed by reviewing the 18 demo answers and the real frontend contract.

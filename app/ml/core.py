@@ -1,52 +1,77 @@
-"""A conservative, runnable RAG baseline with no shared conversation state."""
+"""Run a corpus-backed consultation with per-request conversation context."""
 from __future__ import annotations
 
 import re
 import time
+from decimal import Decimal
 from pathlib import Path
 
 from .corpus import Corpus
-from .grounding import SAFE_RESPONSES, UNTRUSTED_INSTRUCTIONS, render_excerpts, validate_result, validate_generated_result
+from .grounding import (
+    CLARIFY_RESPONSES, MAX_ANSWER_WORDS, MAX_EXCERPT_CHARACTERS, SAFE_RESPONSES,
+    UNTRUSTED_INSTRUCTIONS, render_excerpts, validate_generated_result, validate_result,
+)
 from .llm_client import EvidenceSelector, LLMConfig
-from .protocol import ConsultationRequest, ConsultationResult, ContextMessage, CorpusNotReady, Evidence, InvalidEvidence
+from .protocol import ConsultationRequest, ConsultationResult, CorpusNotReady, Evidence, InvalidEvidence
 from .retriever import BM25Retriever, SearchHit, tokens
 
 CONTACT_PATTERN = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|\+\d[\d ()-]{5,}\d|(?<!\d)[78](?:[ ()-]*\d){10}(?!\d)")
-OUT_OF_SCOPE = re.compile(r"настро(?:ить|йк|йт)|прошив|пароль|схем\w*\s+подключ|техническ\w*\s+документац|инструкци\w*\s+(?:для|по|к)\s+(?:счетчик|счётчик|прибор)|пошагов\w*\s+подключ", re.I)
+OUT_OF_SCOPE = re.compile(
+    r"прошив|пароль|схем\w*\s+подключ|техническ\w*\s+документац|"
+    r"инструкци\w*\s+(?:для|по|к)\s+(?:счетчик|счётчик|прибор)|пошагов\w*\s+подключ|"
+    r"настро(?:ить|йк|йт)\w*\s+(?:\w+\s+){0,2}(?:счетчик|счётчик|прибор)", re.I,
+)
 INJECTION = re.compile(r"игнориру|ignore\s+(?:all\s+)?(?:previous|system)|system\s*prompt|системн\w*\s+(?:промпт|инструкц)|(?:придум|выдум)\w*.*(?:цен|тариф|эконом)|(?:цен|тариф).*из\s+голов", re.I)
-PRICE_QUERY = re.compile(r"цен|стоим|стоит|рубл|окупаем", re.I)
+PRICE_QUERY = re.compile(r"\b(?:цен(?:а|ы|у|е|ой|ам|ах)?|стоимост\w*|стоить|руб\w*|окупаем\w*)\b|₽|\bсколько\s+стоит\b", re.I)
 PRICE_SOURCE = re.compile(r"цен|стоим|рубл|₽|окупаем", re.I)
+PRICE_AMOUNT = re.compile(r"(\d[\d \u00a0\u202f]*(?:[.,]\d+)?)\s*(тыс\.?|млн\.?|миллион\w*|тысяч\w*)?\s*(?:тестов\w*\s+)?(?:₽|руб\w*)", re.I)
 COMPATIBILITY_QUERY = re.compile(r"совмест|поддержива|работа\w*\s+с\s", re.I)
-COMPATIBILITY_SOURCE = re.compile(r"совмест|поддержива|работа\w*\s+с\s", re.I)
+BILL_CHANGE = re.compile(r"(?:вырос|увелич|больш)[^.!?]{0,30}(?:счет|счёт|расход)|(?:счет|счёт)[^.!?]{0,30}(?:вырос|увелич)", re.I)
+BILL_DETAILS = re.compile(r"квт|потреблен|тариф|ценов", re.I)
+FOLLOWUP = re.compile(
+    r"^\s*(?:а\b|и\s+(?:ещ[её]|так|то)\b|кажется\b|примерно\b|исправляю\b)|"
+    r"\b(?:эт[оа]|этого|этому|этим|этих|него|не[её]|они|так(?:ой|ая|ого|их|ие)|"
+    r"с\s+чего\s+(?:нам\s+)?начать|для\s+оценки|вообще\s+стоит\s+проверить)\b", re.I,
+)
+DOCUMENT_DUMP = re.compile(
+    r"\b(?:выгруз\w*|скопиру\w*|процитиру\w*|покаж\w*|вывед\w*|пришл\w*)\b[^.!?]{0,80}"
+    r"(?:баз\w*\s+знаний|системн\w*\s+(?:промпт|инструкц)|(?:документ\w*|материал\w*)\s+целиком|весь\s+корпус)", re.I,
+)
 
 
 def redact_contacts(text: str) -> str:
-    """Defense in depth; backend must keep all contact fields out of ML input."""
+    """Remove recognizable contacts even when the caller has no contact workflow."""
     def replace_contact(match: re.Match) -> str:
-        # Long numeric consumption/budget values are customer facts, not phones.
         suffix = text[match.end():match.end() + 30]
-        if re.match(r"\s*(?:[гмк]?вт|руб|₽|доллар|евро|%|процент|счетчик|счётчик|датчик|шт|лет|год|месяц)", suffix, re.I):
+        quantity = re.fullmatch(r"\+?\d+(?: \d{3})*", match.group().strip())
+        if quantity and re.match(r"\s*(?:[гмк]?вт|руб|₽|доллар|евро|%|процент|счетчик|счётчик|датчик|шт|лет|год|месяц)", suffix, re.I):
             return match.group()
         return "[контакт скрыт]"
+
     text = CONTACT_PATTERN.sub(replace_contact, text)
     text = re.sub(r"(?i)((?:телефон|позвоните|номер\s+телефона)\s*[:—-]?\s*)(?:\+?\d[\d ()-]{5,}\d)", r"\1[контакт скрыт]", text)
     return re.sub(r"(?i)(?:меня\s+зовут|фио\s*:)\s*[^.!?\n;]+", "[имя скрыто]", text)
 
 
+def _query_parts(request: ConsultationRequest) -> tuple[str, str]:
+    latest = redact_contacts(request.latest_user_text).strip()[:2500]
+    if len(tokens(latest)) > 3 and not FOLLOWUP.search(latest):
+        return latest, ""
+    prior = []
+    for message in reversed(request.messages):
+        if message.role != "user" or message.id == request.user_message_id:
+            continue
+        text = redact_contacts(message.text).strip()
+        if len(tokens(text)) >= 3:
+            prior.append(text[:400])
+        if len(prior) == 2:
+            break
+    return latest, "\n".join(reversed(prior))
+
+
 def build_query(request: ConsultationRequest) -> str:
-    latest = redact_contacts(request.latest_user_text).strip()
-    query = latest
-    # Resolve short follow-ups from this request only; never use process history.
-    if len(tokens(latest)) <= 2 or re.search(r"\b(?:это|этого|него|нее|они|такой|такого|также)\b", latest, re.I):
-        previous = [message for message in request.messages if message.role == "user" and message.id != request.user_message_id]
-        for message in reversed(previous):
-            prior = redact_contacts(message.text)
-            if len(tokens(prior)) >= 2:
-                query = prior[:1000] + "\n" + latest
-                break
-    if request.active_topic:
-        query += "\nТема: " + redact_contacts(request.active_topic)[:150]
-    return query[:4000]
+    latest, context = _query_parts(request)
+    return f"{latest}\nКонтекст:\n{context}" if context else latest
 
 
 def _eligible(hit: SearchHit, query: str) -> bool:
@@ -55,25 +80,47 @@ def _eligible(hit: SearchHit, query: str) -> bool:
         return False
     if UNTRUSTED_INSTRUCTIONS.search(hit.chunk.text):
         return False
-    # Intact oversized paragraphs stay in the index but need manual chunk review.
-    if len(hit.chunk.text.split()) > 125 or len(hit.chunk.text) > 6000:
+    excerpt = render_excerpts([hit.chunk.text])
+    if len(excerpt.split()) > MAX_ANSWER_WORDS or len(hit.chunk.text) > MAX_EXCERPT_CHARACTERS:
         return False
     if PRICE_QUERY.search(query) and not PRICE_SOURCE.search(hit.chunk.text):
         return False
-    if COMPATIBILITY_QUERY.search(query) and not COMPATIBILITY_SOURCE.search(hit.chunk.text):
+    if COMPATIBILITY_QUERY.search(query) and not COMPATIBILITY_QUERY.search(hit.chunk.text):
         return False
     return True
 
 
-def _conflicting_prices(hits: list[SearchHit], query: str) -> bool:
+def _conflicting_prices(hits: list[SearchHit], query: str, context: str) -> bool:
     if not PRICE_QUERY.search(query):
         return False
-    price_sets = {
-        tuple(re.findall(r"\d[\d\s.,]*(?:\s+[а-яА-Яa-zA-Z]+){0,2}\s*(?:₽|руб\w*)", hit.chunk.text, re.I))
-        for hit in hits
-    }
-    price_sets.discard(())
-    return len(price_sets) > 1
+    price_terms = set(tokens("стоимость цена ценой стоит рублей окупаемость тариф"))
+    focus = set(tokens(query)) - price_terms
+    if not focus:
+        # Resolve a price-only follow-up against specific terms from the last turn.
+        context_terms = set(tokens(context)) - price_terms
+        if not context_terms:
+            return False
+        strongest_match = max((len(context_terms.intersection(tokens(hit.chunk.text))) for hit in hits), default=0)
+        if strongest_match < 2:
+            return False
+    amounts = set()
+    for hit in hits:
+        source_terms = set(tokens(hit.chunk.title + " " + hit.chunk.text))
+        if focus and not focus.issubset(source_terms):
+            continue
+        if not focus and len(context_terms.intersection(tokens(hit.chunk.text))) < strongest_match:
+            continue
+        price_set = set()
+        for value, magnitude in PRICE_AMOUNT.findall(hit.chunk.text):
+            number = Decimal(re.sub(r"\s+", "", value).replace(",", "."))
+            if magnitude.lower().startswith("тыс"):
+                number *= 1000
+            elif magnitude:
+                number *= 1000000
+            price_set.add(number)
+        if price_set:
+            amounts.add(frozenset(price_set))
+    return len(amounts) > 1
 
 
 class LocalConsultationCore:
@@ -96,68 +143,87 @@ class LocalConsultationCore:
 
     async def consult(self, request: ConsultationRequest) -> ConsultationResult:
         started = time.perf_counter()
-        timings = {"retrieval": 0.0, "rerank": 0.0, "generation": 0.0, "validation": 0.0}
-        query = build_query(request)
+        timings = dict.fromkeys(("retrieval", "rerank", "generation", "validation"), 0.0)
+        latest, context = _query_parts(request)
+        query = f"{latest}\nКонтекст:\n{context}" if context else latest
+        mode = self.selector.config.generation_mode if self.selector else "extractive"
 
         def result(kind: str, text: str, reason: str, evidence: list[Evidence] | None = None) -> ConsultationResult:
             candidate = ConsultationResult(
                 kind=kind, answer_text=text, reason_code=reason, retrieval_query=query,
                 evidence=evidence or [], timings_ms=timings.copy(),
-                model_metadata={"model": self.model_name, "corpus_version": self.corpus_version, "mode": self.selector.config.generation_mode if self.selector else "extractive"},
+                model_metadata={"model": self.model_name, "corpus_version": self.corpus_version, "mode": mode},
             )
             validation_start = time.perf_counter()
-            self.validate_result(candidate)
+            try:
+                self.validate_result(candidate)
+            except InvalidEvidence:
+                candidate = ConsultationResult(
+                    kind="insufficient_knowledge", answer_text=SAFE_RESPONSES["invalid"],
+                    reason_code="invalid_generated_evidence" if mode == "grounded" else "invalid_evidence",
+                    retrieval_query=query, timings_ms=timings.copy(), model_metadata=candidate.model_metadata,
+                )
+                self.validate_result(candidate)
             candidate.timings_ms["validation"] = (time.perf_counter() - validation_start) * 1000
             candidate.timings_ms["total"] = (time.perf_counter() - started) * 1000
             return candidate
 
-        latest = request.latest_user_text
-        if INJECTION.search(latest):
+        if INJECTION.search(latest) or DOCUMENT_DUMP.search(latest):
             return result("insufficient_knowledge", SAFE_RESPONSES["injection"], "untrusted_instruction")
         if OUT_OF_SCOPE.search(latest):
             return result("out_of_scope", SAFE_RESPONSES["scope"], "outside_scope")
-        if re.search(r"(?:вырос|увелич|больш)[^.!?]{0,30}(?:счет|счёт|расход)|(?:счет|счёт)[^.!?]{0,30}(?:вырос|увелич)", latest, re.I) and not re.search(r"квт|потреблен|тариф|ценов", latest, re.I):
+        if BILL_CHANGE.search(latest) and not BILL_DETAILS.search(latest + " " + context):
             return result("clarify", SAFE_RESPONSES["bill"], "missing_material_context")
-        if len(tokens(query)) < 2 or re.fullmatch(r"\s*(?:привет|здравствуйте|добрый день|помогите)[.!?\s]*", latest, re.I):
+        if not tokens(latest) or (len(tokens(latest)) < 2 and not context) or re.fullmatch(r"\s*(?:привет|здравствуйте|добрый день|помогите)[.!?\s]*", latest, re.I):
             return result("clarify", SAFE_RESPONSES["clarify"], "missing_material_context")
-        if not self.ready:
+        if self.retriever is None:
             return result("insufficient_knowledge", SAFE_RESPONSES["corpus"], "corpus_unavailable")
         if request.corpus_version not in {"unavailable", self.corpus_version}:
             raise CorpusNotReady("The requested corpus version differs from the loaded index")
+
         retrieval_start = time.perf_counter()
-        hits = self.retriever.search(query, limit=5)
-        eligible = [hit for hit in hits if _eligible(hit, query)]
+        hits = self.retriever.search(latest, context=context, limit=10)
+        candidates = [
+            hit for hit in hits if len(hit.chunk.text) <= 10000
+            and not UNTRUSTED_INSTRUCTIONS.search(hit.chunk.title + "\n" + hit.chunk.text)
+        ]
         timings["retrieval"] = (time.perf_counter() - retrieval_start) * 1000
-        if _conflicting_prices(hits, query):
+        if _conflicting_prices(candidates, latest, context):
             return result("insufficient_knowledge", SAFE_RESPONSES["conflict"], "conflicting_evidence")
-        if self.selector and self.selector.config.generation_mode == "grounded":
-            # Generation gets broader candidates than the high-precision lexical
-            # baseline. The model must abstain if their meaning is insufficient.
-            candidates = [hit for hit in hits if not UNTRUSTED_INSTRUCTIONS.search(hit.chunk.text) and len(hit.chunk.text) <= 10000]
+
+        if self.selector and mode == "grounded":
             generation_start = time.perf_counter()
-            remaining = request.timeout_budget_ms - int((generation_start - started) * 1000)
-            redacted = request.model_copy(update={"messages": [ContextMessage(id=message.id, role=message.role, text=redact_contacts(message.text)) for message in request.messages]})
-            generated = await self.selector.generate(query, redacted, candidates, remaining)
-            timings["generation"] = (time.perf_counter() - generation_start) * 1000
-            if generated.kind != "answer":
-                safe_text = {
-                    "clarify": SAFE_RESPONSES["generated_clarify"],
-                    "insufficient_knowledge": SAFE_RESPONSES["missing"],
-                    "out_of_scope": SAFE_RESPONSES["generated_scope"],
-                }[generated.kind]
-                return result(generated.kind, safe_text, generated.reason_code)
+            remaining = request.timeout_budget_ms - (generation_start - started) * 1000
             try:
-                return result(generated.kind, generated.answer_text, generated.reason_code, generated.evidence)
+                generated = await self.selector.generate(query, request, candidates[:5], remaining)
             except InvalidEvidence:
+                timings["generation"] = (time.perf_counter() - generation_start) * 1000
                 return result("insufficient_knowledge", SAFE_RESPONSES["invalid"], "invalid_generated_evidence")
+            timings["generation"] = (time.perf_counter() - generation_start) * 1000
+            if generated.kind == "answer":
+                return result("answer", generated.answer_text, generated.reason_code, generated.evidence)
+            if generated.kind == "clarify":
+                question = CLARIFY_RESPONSES.get(generated.answer_text, CLARIFY_RESPONSES["generated_clarify"])
+                if any(message.role == "assistant" and message.text == question for message in request.messages[-5:]):
+                    return result("insufficient_knowledge", SAFE_RESPONSES["missing"], "missing_evidence")
+                return result("clarify", question, generated.reason_code)
+            response = "missing" if generated.kind == "insufficient_knowledge" else "generated_scope"
+            return result(generated.kind, SAFE_RESPONSES[response], generated.reason_code)
+
+        eligible = [hit for hit in candidates if _eligible(hit, latest)]
+        if context:
+            context_terms = set(tokens(context)) - set(tokens(latest))
+            eligible = [hit for hit in eligible if context_terms.intersection(tokens(hit.chunk.title + " " + hit.chunk.text))]
         if not eligible:
             return result("insufficient_knowledge", SAFE_RESPONSES["baseline_missing"], "missing_evidence")
-        if _conflicting_prices(eligible, query):
-            return result("insufficient_knowledge", SAFE_RESPONSES["conflict"], "conflicting_evidence")
         if self.selector:
             generation_start = time.perf_counter()
-            remaining = request.timeout_budget_ms - int((generation_start - started) * 1000)
-            selected_ids = await self.selector.select(query, eligible, remaining)
+            remaining = request.timeout_budget_ms - (generation_start - started) * 1000
+            try:
+                selected_ids = await self.selector.select(query, eligible[:5], remaining)
+            except InvalidEvidence:
+                timings["generation"] = (time.perf_counter() - generation_start) * 1000
+                return result("insufficient_knowledge", SAFE_RESPONSES["invalid"], "invalid_evidence")
             timings["generation"] = (time.perf_counter() - generation_start) * 1000
             eligible = [hit for hit in eligible if hit.chunk.chunk_id in selected_ids]
             if not eligible:

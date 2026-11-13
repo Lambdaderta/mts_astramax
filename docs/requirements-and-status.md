@@ -36,7 +36,7 @@ The referenced original `openapi.yaml`, `frontend-contract.ts`, `ml_contract.py`
 
 Python 3.12, FastAPI, Pydantic v2, SQLite/WAL, the `/api/v1` routes, bearer session tokens, separate review access, optimistic revisions, idempotency keys and explicit enquiry previews come from the team backend design. The case permits alternative stacks and architectures.
 
-The case names Qwen3.8-27B for platform generation, BAAI/bge-m3 for available embeddings and Qwen3 Reranker 8B as an optional reranker (p. 9). The recovered regulation defines an OpenAI-compatible local proxy and environment-supplied access. The actual model identifier must come from that environment. Lexical retrieval is a permissible baseline; embeddings and reranking need measured benefits on the real corpus.
+The case names Qwen3.8-27B for platform generation, BAAI/bge-m3 for available embeddings and Qwen3 Reranker 8B as an optional reranker (p. 9). The regulation defines an OpenAI-compatible local proxy and environment-supplied access. The client uses the configured model when supplied and otherwise follows the sample's `qwen/qwen3.8-27b` default. Lexical retrieval is a permissible baseline. Compare embeddings and reranking on the issued corpus to measure their impact.
 
 The team's median ≤7 seconds and p95 ≤10 seconds targets are internal goals. The Q&A's 5–7 second guidance is an oral usability target, not a verified platform timeout. No latency or consultation-quality claim should be made without measurements on the intended environment and issued corpus.
 
@@ -50,6 +50,6 @@ Generation calls target `{LLM_BASE_URL}/chat/completions` with bearer authorizat
 
 ## Remaining information gaps
 
-Real model calls, product-answer quality and platform execution still require verification against the actual issued corpus and organizer service. Recovering a sample contract does not establish a positive judge score. Product facts cannot be inferred from the case or synthetic fixtures. Corpus availability, local evaluation and measured results are recorded in the README rather than asserted by this requirements document.
+Real model calls, product-answer quality and platform execution still require verification against the issued corpus and organizer service. The [validation record](validation.md) describes the local corpus, retrieval diagnostics and measured results.
 
 See [integration questions](integration-questions.md) for the exact resources and decisions needed next. Private documents, indexes, credentials and user contacts must not be published with the implementation.

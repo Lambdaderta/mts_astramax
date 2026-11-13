@@ -1,5 +1,6 @@
 """HTTP boundary tests separate from consultation and storage behavior."""
-from dataclasses import replace
+import json
+import logging
 import pytest
 import yaml
 from fastapi.testclient import TestClient
@@ -50,3 +51,29 @@ def test_model_opt_in_requires_valid_config(tmp_path,monkeypatch):
     with pytest.raises(ValueError):
         with TestClient(create_app(settings)):
             pass
+
+
+@pytest.mark.parametrize('setting', ['turn_lease_seconds', 'sync_wait_seconds'])
+@pytest.mark.parametrize('value', [float('nan'), float('inf')])
+def test_turn_time_configuration_must_be_finite(setting, value):
+    with pytest.raises(ValueError):
+        Settings(**{setting: value})
+
+
+def test_http_events_include_route_without_request_content(tmp_path, caplog):
+    settings = Settings(database_path=tmp_path / 'db', max_body_bytes=16)
+    with caplog.at_level(logging.INFO, logger='uvicorn.error'), TestClient(create_app(settings)) as client:
+        created = client.post('/api/v1/sessions', json={}).json()
+        session_id, token = created['session']['id'], created['session_token']
+        headers = {'Authorization': f'Bearer {token}'}
+        response = client.get(f'/api/v1/sessions/{session_id}?contact=private-input', headers=headers)
+        rejected = client.post('/api/v1/sessions', content=b'private-body-input', headers=headers)
+
+    events = [json.loads(record.getMessage()) for record in caplog.records if record.getMessage().startswith('{')]
+    request = next(event for event in events if event['request_id'] == response.headers['X-Request-ID'])
+    assert request['route'] == '/api/v1/sessions/{session_id}'
+    assert request['status'] == 200
+    body_error = next(event for event in events if event['request_id'] == rejected.headers['X-Request-ID'])
+    assert body_error['error_code'] == 'BODY_TOO_LARGE'
+    for private in (token, session_id, 'private-input', 'private-body-input'):
+        assert private not in caplog.text

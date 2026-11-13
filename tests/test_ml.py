@@ -11,9 +11,8 @@ from uuid import uuid4
 from app.ml.core import LocalConsultationCore, build_query, redact_contacts
 from app.ml.corpus import Corpus, ingest
 from app.ml.grounding import render_excerpts, validate_generated_result
-from app.ml.llm_client import EvidenceSelector, LLMConfig
+from app.ml.llm_client import LLMConfig
 from app.ml.protocol import ConsultationRequest, ConsultationResult, ContextMessage, CorpusNotReady, Evidence, InvalidEvidence
-from app.ml.retriever import BM25Retriever
 
 FIXTURE = Path(__file__).parent / "fixtures" / "synthetic_knowledge.md"
 
@@ -154,7 +153,7 @@ class MLTests(unittest.TestCase):
             self.consult("Как Маяк-Демо собирает показания?", corpus_version="stale-version")
 
     def test_default_core_does_not_open_network(self):
-        with patch("urllib.request.build_opener", side_effect=AssertionError("Unexpected network")):
+        with patch("httpx.AsyncClient", side_effect=AssertionError("Unexpected network")):
             self.consult("Как Маяк-Демо собирает показания?")
 
     def test_model_requires_explicit_private_data_permission(self):
@@ -181,7 +180,7 @@ class MLTests(unittest.TestCase):
         config = LLMConfig(base_url="http://localhost/v1", model="mock", api_key="dummy", allow_private_corpus=True)
         core = LocalConsultationCore(self.index_dir, llm_config=config)
         chunk = self.corpus.chunks[0]
-        payload = {"kind": "answer", "answer_text": chunk.text, "chunk_ids": [chunk.chunk_id]}
+        payload = {"kind": "answer", "answer_text": "Маяк-Демо собирает показания учебных датчиков.", "chunk_ids": [chunk.chunk_id]}
         core.selector._json_response = AsyncMock(return_value=payload)
         result = asyncio.run(core.consult(request("Как Маяк-Демо собирает показания?")))
         self.assertEqual(result.kind, "answer")

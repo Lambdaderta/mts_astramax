@@ -1,7 +1,8 @@
 from typing import Any, Literal
 from uuid import UUID
-import re
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from .privacy import normalize_phone
 
 
 class Model(BaseModel):
@@ -20,25 +21,6 @@ class TurnInput(Model):
     @classmethod
     def trim(cls, value):
         return value.strip() if isinstance(value, str) else value
-
-
-def normalize_phone(value: str | None) -> str | None:
-    if value is None or not value.strip():
-        return None
-    raw = value.strip()
-    if re.search(r'[^0-9+()\s.-]', raw):
-        raise ValueError('Use an international phone number')
-    digits = re.sub(r'[^0-9]', '', raw)
-    if raw.startswith('8') and len(digits) == 11:
-        digits = '7' + digits[1:]
-    elif not raw.startswith('+'):
-        if not (raw.startswith('7') and len(digits) == 11):
-            raise ValueError('International prefix required')
-    if raw.count('+') > 1 or ('+' in raw and not raw.startswith('+')):
-        raise ValueError('Invalid plus sign')
-    if not 7 <= len(digits) <= 15 or digits.startswith('0'):
-        raise ValueError('Invalid phone length or prefix')
-    return '+' + digits
 
 
 class ContactFields(Model):

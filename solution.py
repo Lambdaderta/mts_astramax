@@ -25,6 +25,7 @@ from app.ml.corpus import SUPPORTED_SUFFIXES, ingest
 from app.ml.protocol import (
     ConsultationRequest, ConsultationUnavailable, ContextMessage, InvalidEvidence,
 )
+from app.privacy import extract_contacts, manager_requested, redact
 
 
 MAX_ARCHIVE_FILES = 10000
@@ -39,6 +40,10 @@ FAILURE_ANSWER = (
 INVALID_QUESTION_ANSWER = (
     "Не удалось определить последний вопрос пользователя в переданном диалоге. "
     "Уточните вопрос, сохранив важные условия задачи."
+)
+CONTACT_REQUEST_ANSWER = (
+    "Для обращения к специалисту укажите телефон для связи. "
+    "Если удобно, добавьте ваше имя и название компании."
 )
 DIALOGUE_LABEL = re.compile(
     r"^[ \t]*(Пользователь|Клиент|User|Human|Ассистент|Assistant|Бот)[ \t]*:[ \t]*",
@@ -164,6 +169,13 @@ def consultation_request(question: Question, corpus_version: str, timeout_ms: in
     if not user_positions:
         raise SubmissionError("A dialogue case must contain a user message")
     messages = messages[:user_positions[-1] + 1]
+    known_values = [
+        value
+        for message in messages if message.role == "user"
+        for value in extract_contacts(message.text).values() if value
+    ]
+    messages = [message.model_copy(update={"text": redact(message.text, known_values=known_values)})
+                for message in messages]
     latest = messages[-1]
     return ConsultationRequest(
         request_id=str(uuid4()), session_id=str(uuid4()), user_message_id=latest.id,
@@ -176,37 +188,41 @@ async def answer_questions(
     questions: list[Question], core, *, workers: int = 3,
     case_timeout_seconds: float = 60, total_timeout_seconds: float = 1080,
 ) -> tuple[list[tuple[str, str]], int]:
-    semaphore = asyncio.Semaphore(workers)
     deadline = time.monotonic() + total_timeout_seconds
-    failures = 0
+    answers = [(question.id, FAILURE_ANSWER) for question in questions]
+    failures = len(questions)
+    pending = iter(enumerate(questions))
 
-    async def answer(question: Question) -> tuple[str, str]:
+    async def worker() -> None:
         nonlocal failures
-        async with semaphore:
+        for index, question in pending:
             remaining = min(case_timeout_seconds, deadline - time.monotonic())
             if remaining <= 0:
-                failures += 1
-                return question.id, FAILURE_ANSWER
+                return
             try:
                 request = consultation_request(question, core.corpus_version, max(1, int(remaining * 1000)))
             except ValueError:
                 # Do not guess a user question from a malformed role transcript.
-                failures += 1
-                return question.id, INVALID_QUESTION_ANSWER
+                answers[index] = question.id, INVALID_QUESTION_ANSWER
+                continue
+            if manager_requested(request.latest_user_text):
+                answers[index] = question.id, CONTACT_REQUEST_ANSWER
+                failures -= 1
+                continue
             try:
-                result = await asyncio.wait_for(core.consult(request), timeout=remaining)
+                async with asyncio.timeout(min(remaining, deadline - time.monotonic())):
+                    result = await core.consult(request)
                 core.validate_result(result)
                 text = result.answer_text.strip()
                 if not text or len(text) > MAX_ANSWER_CHARACTERS:
                     raise InvalidEvidence("Invalid output length")
-                return question.id, text
             except (ConsultationUnavailable, InvalidEvidence, ValueError, TimeoutError):
-                failures += 1
-                return question.id, FAILURE_ANSWER
+                continue
+            answers[index] = question.id, text
+            failures -= 1
 
-    # gather preserves input order, while every request receives fresh context IDs.
-    answers = await asyncio.gather(*(answer(question) for question in questions))
-    return list(answers), failures
+    await asyncio.gather(*(worker() for _ in range(min(workers, len(questions)))))
+    return answers, failures
 
 
 def write_submission(path: Path, answers: list[tuple[str, str]]) -> None:
@@ -248,6 +264,7 @@ def environment_number(name: str, default: float, lower: float, upper: float, *,
 
 
 def run_submission(data_dir: Path, output: Path, *, offline: bool = False) -> dict[str, int | str]:
+    started = time.monotonic()
     # Missing credentials are a configuration failure, never an implicit offline run.
     config = None if offline else LLMConfig.from_env(platform=True)
     questions = read_questions(data_dir / "questions.csv")
@@ -264,7 +281,8 @@ def run_submission(data_dir: Path, output: Path, *, offline: bool = False) -> di
             raise SubmissionError("The supplied knowledge index is not ready")
         answers, failures = asyncio.run(answer_questions(
             questions, core, workers=workers,
-            case_timeout_seconds=case_timeout, total_timeout_seconds=total_timeout,
+            case_timeout_seconds=case_timeout,
+            total_timeout_seconds=total_timeout - (time.monotonic() - started),
         ))
         if [identifier for identifier, _ in answers] != [question.id for question in questions]:
             raise SubmissionError("Output IDs do not match the input")
