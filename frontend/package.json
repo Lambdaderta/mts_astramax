@@ -1,0 +1,39 @@
+{
+  "name": "energytool-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "dev:api": "vite --mode api --host 127.0.0.1",
+    "build": "tsc -b && vite build",
+    "build:api": "tsc -b && vite build --mode api --outDir dist-api",
+    "preview": "vite preview --host 0.0.0.0",
+    "typecheck": "tsc -b",
+    "api:generate": "openapi-typescript docs/openapi.yaml -o src/api/schema.d.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "npm run build && playwright test",
+    "test:api:e2e": "npm run build:api && playwright test --config playwright.api.config.ts"
+  },
+  "dependencies": {
+    "@fontsource/inter": "5.2.8",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "react-router-dom": "7.9.6"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.1",
+    "@testing-library/jest-dom": "6.9.1",
+    "@testing-library/react": "16.3.0",
+    "@testing-library/user-event": "14.6.1",
+    "@types/react": "19.2.2",
+    "@types/react-dom": "19.2.2",
+    "@vitejs/plugin-react": "5.1.0",
+    "jsdom": "27.2.0",
+    "openapi-typescript": "7.13.0",
+    "typescript": "5.9.3",
+    "vite": "7.2.2",
+    "vitest": "4.0.8"
+  }
+}

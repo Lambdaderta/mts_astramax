@@ -6,6 +6,20 @@ The supplied team specification was used for the REST design. During implementat
 
 ## Run
 
+### Frontend
+
+The React + TypeScript frontend is in [`frontend/`](frontend/README.md). Requires Node.js 22.12+ or 24+:
+
+```bash
+cd frontend
+npm ci
+npm run dev
+```
+
+The default mode uses local mocks. To use the backend on port 8000, create `frontend/.env.local` with `API_PROXY_TARGET=http://127.0.0.1:8000`, then run `npm run dev:api` from `frontend/`. Open `http://localhost:5173`. See the frontend README for production builds, API configuration, and tests.
+
+### Backend
+
 Python 3.12:
 
 ```bash

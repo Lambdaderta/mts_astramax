@@ -1,0 +1,11 @@
+node_modules/
+dist/
+dist-api/
+*.tsbuildinfo
+.env
+.env.local
+!.env.api
+test-results/
+test-results-api/
+playwright-report/
+tmp/

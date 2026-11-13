@@ -1,0 +1,37 @@
+:root {
+  font-family: 'Inter', sans-serif;
+  color: #1d1b2b;
+  background: #e4e1f5;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  --bg: #e4e1f5;
+  --surface: #fff;
+  --light: #f5f3fc;
+  --text: #1d1b2b;
+  --muted: #6e6a80;
+  --violet: #6b5bd6;
+  --tint: #eeebfb;
+  --red: #ff0032;
+  --red-tint: #ffe5ea;
+  --green: #137a49;
+  --green-tint: #e3f5ec;
+}
+* { box-sizing: border-box; }
+html, body, #root { margin: 0; min-width: 320px; min-height: 100%; }
+body { font-size: 14px; line-height: 20px; }
+button, input, textarea, select { font: inherit; color: inherit; }
+button, a, input, select, textarea { -webkit-tap-highlight-color: transparent; }
+button { cursor: pointer; border: 0; }
+button:disabled { cursor: default; }
+a { color: var(--violet); text-decoration: none; }
+button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2px solid var(--violet); outline-offset: 3px; }
+::selection { background: #c9c2f4; color: var(--text); }
+input, textarea { caret-color: var(--violet); }
+* { scrollbar-width: thin; scrollbar-color: #c7c0e1 transparent; }
+*::-webkit-scrollbar { width: 6px; height: 6px; }
+*::-webkit-scrollbar-thumb { background: #c7c0e1; border-radius: 8px; }
+h1, h2, h3, p { margin: 0; }
+h1, h2 { font-size: 24px; line-height: 32px; font-weight: 600; }
+h3 { font-size: 16px; line-height: 1.2; font-weight: 600; }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; scroll-behavior: auto !important; } }

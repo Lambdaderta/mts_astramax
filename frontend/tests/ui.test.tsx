@@ -1,0 +1,88 @@
+import { render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { LeadForm } from '../src/ui';
+import { Workspace } from '../src/App';
+import Archive from '../src/Archive';
+import { createMockService } from '../src/service';
+import { demoFixture, memoryStorage } from '../src/demo';
+
+describe('Рабочий интерфейс', () => {
+  it('показывает ошибку телефона и не отправляет форму без согласия', async () => {
+    const user = userEvent.setup(); const submit = vi.fn().mockResolvedValue(undefined);
+    render(<LeadForm onSubmit={submit} pending={false} />);
+    await user.click(screen.getByRole('button', { name: 'Отправить заявку' }));
+    expect(screen.getByText('Введите ФИО')).toBeVisible();
+    expect(screen.getByText('Для отправки заявки нужно согласие на обработку данных')).toBeVisible();
+    await user.type(screen.getByLabelText('ФИО'), 'Тест Тестов');
+    await user.type(screen.getByLabelText('Телефон'), '+7 900 000-00');
+    await user.type(screen.getByLabelText('Компания'), 'Тестовая компания');
+    await user.click(screen.getByLabelText('Согласен на обработку персональных данных'));
+    await user.click(screen.getByRole('button', { name: 'Отправить заявку' }));
+    expect(screen.getByLabelText('Телефон')).toHaveAttribute('aria-invalid', 'true');
+    expect(submit).not.toHaveBeenCalled();
+    await user.type(screen.getByLabelText('Телефон'), '-00');
+    await user.click(screen.getByRole('button', { name: 'Отправить заявку' }));
+    expect(submit).toHaveBeenCalledOnce();
+  });
+  it('отправляет сообщение клавишей Enter и показывает ответ', async () => {
+    const user = userEvent.setup();
+    const service = createMockService(memoryStorage(demoFixture('start')), 0);
+    render(<MemoryRouter initialEntries={['/chat/demo-current']}><Routes><Route path="/chat/:sessionId" element={<Workspace service={service} />} /></Routes></MemoryRouter>);
+    const input = await screen.findByRole('textbox', { name: 'Сообщение' });
+    expect(screen.getByRole('button', { name: 'Отправить сообщение' })).toBeDisabled();
+    await user.type(input, 'Вырос счёт вечером{Enter}');
+    await screen.findByText('Вырос счёт вечером');
+    await waitFor(() => expect(screen.getByText(/Да, можем помочь разобраться/)).toBeVisible());
+  });
+  it('закрывает сброс по Escape, затем создаёт чистую сессию', async () => {
+    const user = userEvent.setup();
+    const service = createMockService(memoryStorage(demoFixture('products')), 0);
+    render(<MemoryRouter><Workspace service={service} demoState="products" /></MemoryRouter>);
+    await screen.findByText('Вот что подойдёт');
+    await user.click(screen.getByRole('button', { name: 'Новый диалог' }));
+    expect(screen.getByRole('dialog')).toBeVisible();
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Новый диалог' }));
+    await user.click(screen.getByRole('button', { name: 'Начать заново' }));
+    await screen.findByRole('heading', { name: 'Здравствуйте! Я помощник МТС EnergyTool' });
+    const sessions = await service.listSessions();
+    expect(sessions[0].messages).toEqual([]);
+    expect(sessions.find(s => s.id === 'demo-current')?.archived).toBe(true);
+  });
+  it('открывает прошлую сессию только для чтения и продолжает в новой', async () => {
+    const user = userEvent.setup();
+    const service = createMockService(memoryStorage(demoFixture('readonly')), 0);
+    render(<MemoryRouter><Workspace service={service} demoState="readonly" /></MemoryRouter>);
+    await screen.findByText(/Прошлый диалог от/);
+    expect(screen.queryByRole('textbox', { name: 'Сообщение' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Продолжить в новом диалоге' }));
+    await screen.findByRole('textbox', { name: 'Сообщение' });
+    expect((await service.listSessions())[0].archived).toBe(false);
+  });
+  it('ищет историю и включает панель отладки', async () => {
+    const user = userEvent.setup();
+    const service = createMockService(memoryStorage(demoFixture('products')), 0);
+    render(<MemoryRouter><Workspace service={service} demoState="products" /></MemoryRouter>);
+    await screen.findByText('Вот что подойдёт');
+    const history = screen.getByRole('complementary', { name: 'История диалогов' });
+    await user.click(within(history).getByRole('button', { name: 'Поиск диалогов' }));
+    await user.type(screen.getByRole('searchbox', { name: 'Найти диалог' }), 'не существует');
+    expect(screen.getByText(/Диалоги не найдены/)).toBeVisible();
+    await user.click(screen.getByLabelText('Отладка'));
+    expect(screen.getByRole('complementary', { name: 'Режим отладки' })).toBeVisible();
+    expect(screen.getByText('20-products/22-askue.md')).toBeVisible();
+  });
+  it('переключает страницы архива, сортирует и меняет размер страницы', async () => {
+    const user = userEvent.setup(); const service = createMockService(memoryStorage([]), 0);
+    render(<MemoryRouter><Archive service={service} /></MemoryRouter>);
+    await screen.findByText('devicelist_20092022');
+    await user.click(screen.getByRole('button', { name: 'Страница 2' }));
+    expect(screen.queryByText('devicelist_20092022')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Имя' }));
+    expect(screen.getByRole('columnheader', { name: 'Имя' })).toHaveAttribute('aria-sort', 'ascending');
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Отображать на странице' }), '10');
+    expect(screen.getAllByRole('row')).toHaveLength(11);
+  });
+});
