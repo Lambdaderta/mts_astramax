@@ -221,4 +221,10 @@ export type TurnProcessing = {
   "turn_id": string;
   "status": "processing";
   "poll_after_ms"?: number;
+  "progress"?: TurnProgress | null;
+};
+
+export type TurnProgress = {
+  "stage": "queued" | "analyzing" | "preparing_answer" | "finalizing";
+  "keywords": Array<"Электроэнергия" | "Вода" | "Тепло" | "Газ" | "Счётчики" | "Тарифы">;
 };

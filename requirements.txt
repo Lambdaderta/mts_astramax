@@ -1,6 +1,7 @@
-# Runtime versions from the organizer's allowed list, retrieved 2026-11-12.
+# Web backend dependencies. The competition ZIP has its own allowed requirements.
 fastapi==0.143.2
 uvicorn==0.54.0
 pydantic==2.14.2
 httpx==0.28.1
 pypdf==6.21.4
+psycopg[binary]==3.3.9

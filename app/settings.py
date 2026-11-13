@@ -17,6 +17,7 @@ class Settings:
     max_body_bytes: int = 32768
     requests_per_minute: int = 120
     llm_enabled: bool = False
+    database_url: str = field(default='', repr=False)
 
     def __post_init__(self):
         if not 0 < self.ml_timeout_seconds <= 120:
@@ -29,11 +30,14 @@ class Settings:
             raise ValueError('Request body limit must be positive')
         if '*' in self.cors_origins:
             raise ValueError('Configure explicit CORS origins')
+        if self.database_url and not self.database_url.startswith(('postgresql://', 'postgres://')):
+            raise ValueError('DATABASE_URL must use PostgreSQL')
 
     @classmethod
     def from_env(cls):
         return cls(
             database_path=os.getenv('DATABASE_PATH', 'data/energytool.db'),
+            database_url=os.getenv('DATABASE_URL', '').strip(),
             index_dir=os.getenv('INDEX_DIR', 'private/index'),
             review_token=os.getenv('REVIEW_TOKEN', ''),
             ml_timeout_seconds=float(os.getenv('ML_TIMEOUT_SECONDS', '10')),

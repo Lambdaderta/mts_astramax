@@ -23,7 +23,23 @@ Docker:
 docker compose up --build
 ```
 
-The API binds to localhost port 8000. SQLite lives in the `energytool_data` volume. The private index is mounted read-only from `./private/index` or `INDEX_DIR_HOST`. Without an index, session and contact workflows remain available, `/health/ready` returns 503, and product questions receive an explicit knowledge-unavailable response. `/health/live` checks the running process. See [validation results](docs/validation.md) for the container checks.
+The API binds to localhost port 8000 (`API_PORT` overrides it). Compose starts PostgreSQL 17 on its internal network and stores its data in `postgres_data`. The default password is for local use. Set `POSTGRES_PASSWORD` for a shared instance, or provide `DATABASE_URL` for a managed PostgreSQL database. The direct Python command uses `DATABASE_URL` if set, or the local SQLite file from `DATABASE_PATH` otherwise.
+
+The private index is mounted read-only from `./private/index` or `INDEX_DIR_HOST`. Without an index, session and contact workflows remain available, `/health/ready` returns 503, and product questions receive an explicit knowledge-unavailable response. `/health/live` checks the running process. See [validation results](docs/validation.md) for the container checks.
+
+### Import existing SQLite history
+
+Use an empty PostgreSQL database. Stop the old API and make a consistent SQLite backup before switching. The import copies existing history, sessions, and leads while keeping the original file readable. Session tokens and existing request IDs still work after the import. The importer rejects a destination with application data.
+
+```bash
+docker compose build api
+docker compose run --rm --volume /absolute/path/to/backup:/legacy:ro \
+  --entrypoint python api scripts/migrate_sqlite_to_postgres.py \
+  --sqlite-path /legacy/energytool.db
+docker compose up -d
+```
+
+For a PostgreSQL server accessible from the host, run the same Python script with `DATABASE_URL` exported and pass the local backup path. Verify existing conversations before discarding the old SQLite volume.
 
 To ingest an authorized local corpus:
 
@@ -56,8 +72,8 @@ Set a private `REVIEW_TOKEN` to enable `/api/v1/review/*`. An empty token disabl
 ## Implemented
 
 - FastAPI/Pydantic REST endpoints, Russian customer-facing messages, JSON errors and request IDs.
-- SQLite/WAL persistence with an additive v1-to-v2 migration, per-session bearer token hashes, isolated append-only histories and protected review access. Readiness verifies the database schema and index availability.
-- Durable turn acceptance, idempotent retries, asynchronous polling, one active turn per session enforced in SQLite, expiring leases and attempt fencing after a crashed worker. Failed model calls preserve the user message; failed response commits never report success.
+- PostgreSQL persistence with per-session write serialization, per-session bearer token hashes, isolated append-only histories and protected review access. SQLite remains available for local development and import. Readiness verifies the database schema and index availability.
+- Durable turn acceptance, idempotent retries, asynchronous polling, one active turn per session enforced in the database, expiring leases and attempt fencing after a crashed worker. Failed model calls preserve the user message; failed response commits never report success.
 - Contacts entered through a versioned form or explicit chat labels; phone normalization; full and partial enquiries; persisted preview snapshots; stale-preview rejection; explicit idempotent confirmation. Saving is local, not delivery to a CRM or manager.
 - Historical explicit contact values remain redacted after correction or clearing. Raw history stays available only to the session owner and authorized review access. This is deterministic redaction, not a general PII detector.
 - Structured logs cover API responses, turn completion, model failures, retries, lead confirmations, and session closure. They carry operational IDs and durations. A log collector can aggregate the events and timing fields into counters and latency distributions.
@@ -81,6 +97,19 @@ Frontend flow:
 4. Read/edit `/lead-draft` using `expected_revision`; omitted fields remain unchanged and explicit null clears a field.
 5. Create `/lead-preview`, display it, then confirm via `/leads` with `preview_id`, a stable `idempotency_key`, and `confirm:true`. Any new turn or contact change invalidates the preview.
 6. A new dialogue is a new session. Closing preserves history. Successful retries remain readable after closing; new changes are rejected.
+
+### Processing indicator
+
+Add `?include_progress=true` to `POST /api/v1/sessions/{id}/turns` and to the polling URL `GET /api/v1/sessions/{id}/turns/{turn_id}`. When the API returns `202`, render the newest `progress.stage` and optional topic labels from `progress.keywords`. Continue polling after `poll_after_ms` until a completed or failed response. A fast turn can return the final result immediately.
+
+| `progress.stage` | Example text for the chat |
+| --- | --- |
+| `queued` | Запрос принят |
+| `analyzing` | Учитываю контекст диалога |
+| `preparing_answer` | Готовлю ответ |
+| `finalizing` | Сохраняю результат |
+
+For a question about gas rates, `progress` can be `{"stage":"preparing_answer","keywords":["Газ","Тарифы"]}`. Labels come from a fixed list of topics and can be empty. The indicator describes processing while the final response is being prepared. Show it as transient status in the chat and replace it with the final result.
 
 A failed earlier turn cannot be retried after a newer user turn; the API returns `RETRY_SUPERSEDED`. Confirming the same preview with a different idempotency key returns `PREVIEW_ALREADY_CONFIRMED`, preventing duplicate leads. These additional rules are documented implementation choices.
 
@@ -111,7 +140,13 @@ python -m pytest -q
 python scripts/smoke.py --base-url http://127.0.0.1:8000
 ```
 
-The smoke script creates a synthetic enquiry on the running server. Tests use temporary databases and synthetic knowledge; local fake-proxy tests open a loopback socket. No real model credentials or product corpus are required for the test suite.
+Set `TEST_POSTGRES_URL` to a disposable PostgreSQL database to include the PostgreSQL and SQLite import tests. The test role needs permission to create and drop test schemas. Each test uses its own schema. For example, when the test database is reachable on a local port:
+
+```bash
+TEST_POSTGRES_URL=postgresql://energytool@127.0.0.1:5432/energytool python -m pytest -q
+```
+
+The smoke script creates a synthetic enquiry on the running server. Tests use temporary databases and synthetic knowledge. Local fake-proxy tests open a loopback socket. The suite runs without model credentials and uses synthetic product content.
 
 See [validation results](docs/validation.md) for the exact executed checks and their limits, and [requirements](docs/requirements-and-status.md) for the source distinction. For retrieval evaluation, `scripts/evaluate.py` accepts labelled JSONL queries and reports Recall@k and retrieval latency. It does not grade generated answers.
 
