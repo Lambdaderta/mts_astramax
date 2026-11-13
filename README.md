@@ -67,6 +67,8 @@ LLM_MODEL=<provided at runtime>
 
 The organizer supplies proxy credentials automatically on its platform. Environment aliases `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL` and `GEN_MODEL` are supported by the shared client. The web API requires an explicit opt-in to transmit corpus excerpts. TLS is required except for localhost or explicitly enabled internal HTTP (`LLM_ALLOW_INTERNAL_HTTP=true`). Redirects are refused. A single wall-clock budget covers model transport, response reads and transient retries. See `.env.example` for other settings.
 
+With generation enabled, retrieval defaults to BM25 plus dense cosine search, combined through reciprocal-rank fusion. `EMB_MODEL` selects the organizer embedding model (`baai/bge-m3` is the recovered sample default); it uses the same proxy and key, with optional `EMBEDDER_API_KEY`. The corpus is embedded once at startup. `TOP_K=6` passages reach the generator from 20 candidates per retrieval branch. Set `RETRIEVAL_MODE=bm25` for an ablation. Embedding failures produce a recorded lexical fallback. Optional vector caches belong in a writable private `EMBEDDING_CACHE_DIR`; by default vectors stay in memory. See [ML configuration and evaluation](app/ml/README.md).
+
 Set a private `REVIEW_TOKEN` to enable `/api/v1/review/*`. An empty token disables access. Generate it locally with `python -c "import secrets; print(secrets.token_urlsafe(32))"` and keep it out of frontend builds. `CORS_ORIGINS` allows explicit origins only. `REQUESTS_PER_MINUTE` limits requests per client address within one process. `MAX_BODY_BYTES` bounds incoming HTTP request bodies.
 
 ## Implemented
@@ -77,7 +79,7 @@ Set a private `REVIEW_TOKEN` to enable `/api/v1/review/*`. An empty token disabl
 - Contacts entered through a versioned form or explicit chat labels; phone normalization; full and partial enquiries; persisted preview snapshots; stale-preview rejection; explicit idempotent confirmation. Saving is local, not delivery to a CRM or manager.
 - Historical explicit contact values remain redacted after correction or clearing. Raw history stays available only to the session owner and authorized review access. This is deterministic redaction, not a general PII detector.
 - Structured logs cover API responses, turn completion, model failures, retries, lead confirmations, and session closure. They carry operational IDs and durations. A log collector can aggregate the events and timing fields into counters and latency distributions.
-- A transport-independent consultation core, deterministic section-aware ingestion, corpus checksums, BM25 retrieval that uses relevant prior turns, measured stage timings and source traces. Grounded responses require short source-matching claims and relevant qualifications. Complete supporting evidence is available to authorized reviewers.
+- A transport-independent consultation core, deterministic section-aware ingestion, corpus checksums, hybrid BM25/dense retrieval with relevant prior turns, measured stage timings and source traces. Grounded responses require short source-matching claims and relevant qualifications. Complete supporting evidence is available to authorized reviewers.
 - Official `solution.py` CSV processing with independent contexts, safe runtime ZIP extraction, bounded concurrency, atomic output and a deterministic root-only submission packager. The API and platform use the same core.
 
 ## API integration
@@ -148,12 +150,12 @@ TEST_POSTGRES_URL=postgresql://energytool@127.0.0.1:5432/energytool python -m py
 
 The smoke script creates a synthetic enquiry on the running server. Tests use temporary databases and synthetic knowledge. Local fake-proxy tests open a loopback socket. The suite runs without model credentials and uses synthetic product content.
 
-See [validation results](docs/validation.md) for the exact executed checks and their limits, and [requirements](docs/requirements-and-status.md) for the source distinction. For retrieval evaluation, `scripts/evaluate.py` accepts labelled JSONL queries and reports Recall@k and retrieval latency. It does not grade generated answers.
+See [validation results](docs/validation.md) for executed checks and their limits, and [requirements](docs/requirements-and-status.md) for the source distinction. `scripts/evaluate.py` compares BM25, dense and hybrid retrieval against versioned private relevance labels, reporting Recall/MRR/nDCG and required evidence-group coverage. It does not grade generated answers. Private labels, vectors and reports stay outside source control.
 
 ## Remaining work
 
 Live Qwen response quality and latency remain unverified. Claim validation is deliberately conservative and can reject valid paraphrases. Product applicability, conditions spread across documents and source precedence still need evaluation on the issued corpus.
 
-Dialogue reasoning uses bounded history and stores explicit meter counts by resource with their source message. A later correction supersedes the previous value for that resource. General semantic facts, structured product recommendations, dense embedding search and model-based reranking remain open. Manager summaries use the latest substantive customer messages, retained facts and the latest outstanding consultation question when available.
+Dialogue reasoning uses bounded history and stores explicit meter counts by resource with their source message. A later correction supersedes the previous value for that resource. General semantic facts, structured product recommendations and model-based reranking remain open. Manager summaries use the latest substantive customer messages, retained facts and the latest outstanding consultation question when available.
 
 The chat frontend, presentation, deployment, CRM integration and competition upload were outside this backend/ML pass. [Integration questions](docs/integration-questions.md) lists the remaining external inputs; the most useful next step is a run against the organizer proxy, followed by reviewing the 18 demo answers and the real frontend contract.

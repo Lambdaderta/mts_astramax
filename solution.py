@@ -187,6 +187,7 @@ def consultation_request(question: Question, corpus_version: str, timeout_ms: in
 async def answer_questions(
     questions: list[Question], core, *, workers: int = 3,
     case_timeout_seconds: float = 60, total_timeout_seconds: float = 1080,
+    retrieval_counts: dict[str, int] | None = None,
 ) -> tuple[list[tuple[str, str]], int]:
     deadline = time.monotonic() + total_timeout_seconds
     answers = [(question.id, FAILURE_ANSWER) for question in questions]
@@ -212,6 +213,9 @@ async def answer_questions(
             try:
                 async with asyncio.timeout(min(remaining, deadline - time.monotonic())):
                     result = await core.consult(request)
+                if retrieval_counts is not None:
+                    retrieval_mode = result.model_metadata.get("retrieval_mode", "unknown")
+                    retrieval_counts[retrieval_mode] = retrieval_counts.get(retrieval_mode, 0) + 1
                 core.validate_result(result)
                 text = result.answer_text.strip()
                 if not text or len(text) > MAX_ANSWER_CHARACTERS:
@@ -276,20 +280,34 @@ def run_submission(data_dir: Path, output: Path, *, offline: bool = False) -> di
         document_count = extract_knowledge(data_dir / "knowledge-base.zip", working / "corpus")
         corpus = ingest(working / "corpus")
         corpus.save(working / "index")
-        core = build_core(working / "index", llm_config=config)
+        core = build_core(working / "index", llm_config=config, platform=not offline)
         if not core.ready:
             raise SubmissionError("The supplied knowledge index is not ready")
-        answers, failures = asyncio.run(answer_questions(
-            questions, core, workers=workers,
-            case_timeout_seconds=case_timeout,
-            total_timeout_seconds=total_timeout - (time.monotonic() - started),
-        ))
+        retrieval_counts: dict[str, int] = {}
+        async def execute():
+            remaining = total_timeout - (time.monotonic() - started)
+            await core.prepare_retrieval(timeout_budget_ms=max(1, int(min(120, remaining * 0.25) * 1000)))
+            return await answer_questions(
+                questions, core, workers=workers,
+                case_timeout_seconds=case_timeout,
+                total_timeout_seconds=total_timeout - (time.monotonic() - started),
+                retrieval_counts=retrieval_counts,
+            )
+        answers, failures = asyncio.run(execute())
         if [identifier for identifier, _ in answers] != [question.id for question in questions]:
             raise SubmissionError("Output IDs do not match the input")
         write_submission(output, answers)
+    completed_modes = {mode for mode, count in retrieval_counts.items() if count and mode != "not_run"}
+    actual_retrieval = next(iter(completed_modes)) if len(completed_modes) == 1 else "mixed" if completed_modes else "not_run"
+    if core._prepare_failure and not completed_modes:
+        actual_retrieval = "lexical_fallback"
     return {
         "questions": len(questions), "documents": document_count,
         "fallbacks": failures, "mode": "offline" if offline else "platform-model",
+        "retrieval": actual_retrieval,
+        "configured_retrieval": core.retrieval_config.mode,
+        "retrieval_fallback": core._prepare_failure or "none",
+        "retrieval_counts": ",".join(f"{mode}:{count}" for mode, count in sorted(retrieval_counts.items())) or "none",
     }
 
 
@@ -311,7 +329,10 @@ def main(argv=None) -> int:
     print(
         f"Wrote submission.csv: {result['questions']} answers; "
         f"{result['documents']} documents; mode={result['mode']}; "
-        f"fallbacks={result['fallbacks']}.", file=sys.stderr,
+        f"fallbacks={result['fallbacks']}; retrieval={result['retrieval']}; "
+        f"configured_retrieval={result['configured_retrieval']}; "
+        f"startup_retrieval_fallback={result['retrieval_fallback']}; "
+        f"retrieval_counts={result['retrieval_counts']}.", file=sys.stderr,
     )
     return 0
 

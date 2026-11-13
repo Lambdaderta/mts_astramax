@@ -8,7 +8,7 @@ import pytest
 from app.ml.core import LocalConsultationCore, build_query
 from app.ml.corpus import ingest
 from app.ml.grounding import CLARIFY_RESPONSES, validate_generated_result
-from app.ml.llm_client import DEFAULT_MODEL, EvidenceSelector, LLMConfig
+from app.ml.llm_client import DEFAULT_MODEL, EvidenceSelector, LLMConfig, _read_model_response
 from app.ml.protocol import (
     ConsultationRequest, ConsultationResult, ConsultationUnavailable, ContextMessage, Evidence, InvalidEvidence, UserFact,
 )
@@ -16,6 +16,32 @@ from app.ml.protocol import (
 
 def config(**kwargs):
     return LLMConfig("http://localhost/v1", "mock", "dummy", allow_private_corpus=True, **kwargs)
+
+
+@pytest.mark.parametrize("content", [
+    '{"chunk_ids":[]}',
+    '<think>Synthetic reasoning is not answer content.</think>\n{"chunk_ids":[]}',
+    '<think>Synthetic reasoning.</think>\n```json\n{"chunk_ids":[]}\n```',
+])
+def test_qwen_reasoning_envelope_only_exposes_final_json(content):
+    response = httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {
+        "content": content, "reasoning_content": "Separate synthetic reasoning is ignored.",
+    }}]})
+    assert asyncio.run(_read_model_response(response)) == {"chunk_ids": []}
+
+
+@pytest.mark.parametrize("content,reason", [
+    ('<think>Unfinished reasoning {"chunk_ids":[]}', "stop"),
+    ('{"chunk_ids":[]}', "length"),
+    ('<think>' + 'x' * 32769 + '</think>{"chunk_ids":[]}', "stop"),
+    ('<think><think>Nested</think></think>{"chunk_ids":[]}', "stop"),
+    ('<think>First</think><think>Second</think>{"chunk_ids":[]}', "stop"),
+    ('{"chunk_ids":[]}', "content_filter"),
+])
+def test_truncated_or_unclosed_reasoning_is_not_an_answer(content, reason):
+    response = httpx.Response(200, json={"choices": [{"finish_reason": reason, "message": {"content": content}}]})
+    with pytest.raises(InvalidEvidence):
+        asyncio.run(_read_model_response(response))
 
 
 def request(text, **kwargs):

@@ -195,8 +195,19 @@ async def _read_model_response(response: httpx.Response) -> dict[str, Any]:
                 raise ValueError("Oversized model response")
             data.extend(chunk)
         parsed = json.loads(data)
-        content = parsed["choices"][0]["message"]["content"]
+        choice = parsed["choices"][0]
+        if choice.get("finish_reason") in {"length", "content_filter", "tool_calls", "function_call"}:
+            raise ValueError("Model did not complete a final answer")
+        content = choice["message"]["content"]
         if isinstance(content, str):
+            # Some Qwen-compatible servers put a bounded reasoning prefix in
+            # content instead of a separate reasoning_content field. Only the
+            # final JSON is considered answer material; unclosed prefixes fail.
+            thought = re.match(r"\A\s*<think>(.*?)</think>\s*", content, flags=re.S)
+            if thought:
+                if len(thought[1]) > 32768 or "<think>" in thought[1]:
+                    raise ValueError("Unsupported reasoning envelope")
+                content = content[thought.end():]
             # Some compatible proxies wrap an otherwise valid JSON object in one fence.
             fence = re.fullmatch(r"\s*```(?:json)?\s*(\{.*\})\s*```\s*", content, re.S | re.I)
             if fence:

@@ -33,6 +33,10 @@ MODEL_ENV = {
     "TEMPERATURE", "MAX_TOKENS", "ML_TIMEOUT_SECONDS", "LLM_MAX_RETRIES",
     "DATA_DIR", "MAX_WORKERS", "CONSULTATION_TIMEOUT_SECONDS", "SUBMISSION_TIMEOUT_SECONDS",
     "PYTHONPATH",
+    "RETRIEVAL_MODE", "TOP_K", "RETRIEVAL_CANDIDATES", "RRF_K", "LEXICAL_WEIGHT", "DENSE_WEIGHT",
+    "RETRIEVAL_TIMEOUT_SECONDS", "EMBEDDING_CACHE_DIR", "EMB_MODEL", "EMBEDDER_API_KEY",
+    "EMBEDDING_DIMENSIONS", "EMBEDDING_MODEL_REVISION", "EMBEDDING_BATCH_SIZE",
+    "EMBEDDING_TIMEOUT_SECONDS", "EMBEDDING_MAX_RETRIES",
 }
 
 
@@ -277,18 +281,25 @@ def fake_proxy():
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             requests.append({"path": self.path, "auth": self.headers.get("Authorization"), "body": body})
-            if state["status"] != 200:
-                self.send_response(state["status"])
+            embedding_query_failure = state.get("embedding_query_failure") and self.path.endswith("/embeddings") and sum(
+                item["path"].endswith("/embeddings") for item in requests
+            ) > 1
+            if state["status"] != 200 or embedding_query_failure:
+                self.send_response(401 if embedding_query_failure else state["status"])
                 self.end_headers()
                 self.wfile.write(b"synthetic provider error, never expose this")
                 return
-            supplied = json.loads(body["messages"][-1]["content"])
-            sources = supplied["SOURCE"]
-            if sources:
-                model = {"kind": "answer", "answer_text": SYNTHETIC_CLAIM, "chunk_ids": [sources[0]["chunk_id"]]}
+            if self.path.endswith("/embeddings"):
+                payload = {"data": [{"index": i, "embedding": [1.0, 0.5, 0.1]} for i, _ in enumerate(body["input"])]}
             else:
-                model = {"kind": "insufficient_knowledge", "answer_text": "Нет сведений.", "chunk_ids": []}
-            response = json.dumps({"choices": [{"message": {"content": json.dumps(model, ensure_ascii=False)}}]}, ensure_ascii=False).encode()
+                supplied = json.loads(body["messages"][-1]["content"])
+                sources = supplied["SOURCE"]
+                if sources:
+                    model = {"kind": "answer", "answer_text": SYNTHETIC_CLAIM, "chunk_ids": [sources[0]["chunk_id"]]}
+                else:
+                    model = {"kind": "insufficient_knowledge", "answer_text": "Нет сведений.", "chunk_ids": []}
+                payload = {"choices": [{"message": {"content": json.dumps(model, ensure_ascii=False)}}]}
+            response = json.dumps(payload, ensure_ascii=False).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(response)))
@@ -322,20 +333,27 @@ def test_packaged_official_csv_adapter_uses_model_aliases_and_independent_dialog
         "DATA_DIR": str(data), "OPENAI_BASE_URL": base_url,
         "OPENAI_API_KEY": "synthetic-test-key", "GEN_MODEL": "synthetic-test-model",
         "TEMPERATURE": "0.2", "MAX_TOKENS": "500", "MAX_WORKERS": "2",
+        "EMB_MODEL": "synthetic-embedding-model",
     })
     process = subprocess.run([sys.executable, "solution.py"], cwd=runtime, env=env, text=True, capture_output=True, timeout=20)
     assert process.returncode == 0, process.stderr
     assert "mode=platform-model" in process.stderr
     assert "fallbacks=0" in process.stderr
+    assert "retrieval=hybrid" in process.stderr
+    assert "retrieval_fallback=none" in process.stderr
+    assert "retrieval_counts=hybrid:2" in process.stderr
     rows = csv_answers(runtime / "submission.csv")
     assert [row["id"] for row in rows] == ["single", "dialogue"]
     assert all(row["answer"] == SYNTHETIC_CLAIM for row in rows)
-    assert len(calls) == 2
-    assert all(call["path"] == "/v1/chat/completions" for call in calls)
     assert all(call["auth"] == "Bearer synthetic-test-key" for call in calls)
-    assert all(call["body"]["model"] == "synthetic-test-model" for call in calls)
-    assert all(call["body"]["temperature"] == 0.2 and call["body"]["max_tokens"] == 500 for call in calls)
-    dialogues = [json.loads(call["body"]["messages"][-1]["content"])["dialogue"] for call in calls]
+    embedding_calls = [call for call in calls if call["path"] == "/v1/embeddings"]
+    generation_calls = [call for call in calls if call["path"] == "/v1/chat/completions"]
+    assert len(embedding_calls) == 3  # One shared corpus build and two distinct questions.
+    assert len(generation_calls) == 2
+    assert all(call["body"]["model"] == "synthetic-embedding-model" for call in embedding_calls)
+    assert all(call["body"]["model"] == "synthetic-test-model" for call in generation_calls)
+    assert all(call["body"]["temperature"] == 0.2 and call["body"]["max_tokens"] == 500 for call in generation_calls)
+    dialogues = [json.loads(call["body"]["messages"][-1]["content"])["dialogue"] for call in generation_calls]
     assert sorted(len(dialogue) for dialogue in dialogues) == [1, 3]
     assert "synthetic-test-key" not in process.stderr + process.stdout
 
@@ -354,4 +372,25 @@ def test_provider_failure_still_emits_every_id_without_false_product_claim(tmp_p
     assert result["fallbacks"] == 2
     assert [row["id"] for row in csv_answers(output)] == ["single", "dialogue"]
     assert all(row["answer"] == solution.FAILURE_ANSWER for row in csv_answers(output))
-    assert len(calls) == 2  # Authentication errors must not be retried.
+    assert result["retrieval"] == "lexical_fallback"
+    assert result["retrieval_fallback"] == "embedding_http_error"
+    assert len(calls) == 3  # One failed corpus build, then two generation attempts; no auth retries.
+
+
+def test_query_embedding_failures_are_not_reported_as_successful_hybrid(tmp_path, fake_proxy, monkeypatch):
+    base_url, _, state = fake_proxy
+    state["embedding_query_failure"] = True
+    for name in MODEL_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("LLM_BASE_URL", base_url)
+    monkeypatch.setenv("LLM_API_KEY", "synthetic-test-key")
+    monkeypatch.setenv("LLM_MODEL", "synthetic-test-model")
+    data = make_data(tmp_path / "data")
+    output = tmp_path / "submission.csv"
+    result = solution.run_submission(data, output)
+    assert result["fallbacks"] == 0  # Grounded generation still succeeds using BM25.
+    assert result["configured_retrieval"] == "hybrid"
+    assert result["retrieval"] == "lexical_fallback"
+    assert result["retrieval_fallback"] == "none"  # Corpus warm-up itself succeeded.
+    assert result["retrieval_counts"] == "lexical_fallback:2"
+    assert all(row["answer"] == SYNTHETIC_CLAIM for row in csv_answers(output))

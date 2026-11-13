@@ -30,6 +30,7 @@ def create_app(settings: Settings | None = None, core: ConsultationCore | None =
             from .ml.adapter import build_core, LLMConfig
             llm_config = LLMConfig.from_env(platform=False) if settings.llm_enabled else None
             selected_core = build_core(settings.index_dir, llm_config=llm_config)
+            await selected_core.prepare_retrieval()
         database = Database(settings.database_url or settings.database_path)
         app.state.service = Service(database, selected_core, settings)
         try:
