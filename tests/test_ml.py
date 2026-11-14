@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from app.ml.core import LocalConsultationCore, build_query, redact_contacts
 from app.ml.corpus import Corpus, ingest
-from app.ml.grounding import render_excerpts, validate_generated_result
+from app.ml.grounding import is_verbatim_supported, render_excerpts, validate_generated_result
 from app.ml.llm_client import LLMConfig
 from app.ml.protocol import ConsultationRequest, ConsultationResult, ContextMessage, CorpusNotReady, Evidence, InvalidEvidence
 
@@ -187,21 +187,22 @@ class MLTests(unittest.TestCase):
         self.assertEqual(result.model_metadata["mode"], "grounded")
         core.validate_result(result)
 
-    def test_generated_unproven_number_falls_back_safely(self):
+    def test_source_review_rejects_generated_unproven_number(self):
         config = LLMConfig(base_url="http://localhost/v1", model="mock", api_key="dummy", allow_private_corpus=True)
         core = LocalConsultationCore(self.index_dir, llm_config=config)
         chunk = self.corpus.chunks[0]
         core.selector._json_response = AsyncMock(return_value={"kind": "answer", "answer_text": "Стоимость составляет 999 рублей.", "chunk_ids": [chunk.chunk_id]})
+        core.selector.review = AsyncMock(return_value=ConsultationResult(kind="insufficient_knowledge", answer_text="Нет подтверждения стоимости.", reason_code="missing_evidence"))
         result = asyncio.run(core.consult(request("Какая стоимость Маяк-Демо?")))
         self.assertEqual(result.kind, "insufficient_knowledge")
-        self.assertEqual(result.reason_code, "invalid_generated_evidence")
+        self.assertEqual(result.reason_code, "missing_evidence")
         self.assertNotIn("999", result.answer_text)
+        core.selector.review.assert_awaited_once()
 
-    def test_generated_unit_change_is_rejected(self):
+    def test_generated_unit_change_requires_semantic_review(self):
         chunk = self.corpus.chunks[0]
         result = ConsultationResult(kind="answer", answer_text="Экономия 100%.", reason_code="grounded_answer", evidence=[Evidence(document_id=chunk.document_id, chunk_id=chunk.chunk_id, quote=chunk.text)])
-        with self.assertRaises(InvalidEvidence):
-            validate_generated_result(result, self.corpus)
+        self.assertFalse(is_verbatim_supported(result, self.corpus))
 
     def test_model_nonanswer_cannot_hide_a_product_claim(self):
         config = LLMConfig(base_url="http://localhost/v1", model="mock", api_key="dummy", allow_private_corpus=True)
@@ -217,11 +218,15 @@ class MLTests(unittest.TestCase):
         self.assertTrue(any(item.title == "Main / Alpha" and item.text == "Первый раздел." for item in corpus.chunks))
         self.assertTrue(any(item.title == "Main / Beta" and item.text == "Второй раздел." for item in corpus.chunks))
 
-    def test_generated_scale_currency_power_and_guarantee_bypasses_rejected(self):
+    def test_numeric_changes_require_review_and_guarantees_are_rejected(self):
         (self.corpus_dir / FIXTURE.name).write_text("Цена учебного продукта — 100 рублей. Мощность — 50 кВт. Экономия не гарантируется.")
         corpus = ingest(self.corpus_dir)
         chunk = corpus.chunks[0]
-        for answer in ["Цена 100 тысяч рублей.", "Цена 100 долларов.", "Мощность 50 МВт.", "Мощность 50 мегаватт.", "Экономия гарантирована.", "Гарантированная экономия."]:
+        for answer in ["Цена 100 тысяч рублей.", "Цена 100 долларов.", "Мощность 50 МВт.", "Мощность 50 мегаватт."]:
+            with self.subTest(answer=answer):
+                result = ConsultationResult(kind="answer", answer_text=answer, reason_code="grounded_answer", evidence=[Evidence(document_id=chunk.document_id, chunk_id=chunk.chunk_id, quote=chunk.text)])
+                self.assertFalse(is_verbatim_supported(result, corpus))
+        for answer in ["Экономия гарантирована.", "Гарантированная экономия."]:
             with self.subTest(answer=answer):
                 result = ConsultationResult(kind="answer", answer_text=answer, reason_code="grounded_answer", evidence=[Evidence(document_id=chunk.document_id, chunk_id=chunk.chunk_id, quote=chunk.text)])
                 with self.assertRaises(InvalidEvidence):
@@ -235,15 +240,16 @@ class MLTests(unittest.TestCase):
         self.assertNotIn("123-45-67", redact_contacts("Позвоните +7 (999) 123-45-67"))
         self.assertNotIn("1234567", redact_contacts("телефон: 1234567"))
 
-    def test_generated_conflicting_prices_abstain_before_network(self):
+    def test_grounded_price_conflicts_are_assessed_with_context(self):
         (self.corpus_dir / "other.md").write_text("Стоимость Маяк-Демо составляет 200 тестовых рублей за учебный стенд.")
         ingest(self.corpus_dir).save(self.index_dir)
         config = LLMConfig(base_url="http://localhost/v1", model="mock", api_key="dummy", allow_private_corpus=True)
         core = LocalConsultationCore(self.index_dir, llm_config=config)
-        core.selector._json_response = AsyncMock(side_effect=AssertionError("Conflicting evidence must not be generated"))
+        core.selector._json_response = AsyncMock(return_value={"kind": "insufficient_knowledge", "answer_text": "Различные цены без условий.", "chunk_ids": []})
         result = asyncio.run(core.consult(request("Какая стоимость Маяк-Демо?")))
-        self.assertEqual(result.reason_code, "conflicting_evidence")
+        self.assertEqual(result.reason_code, "missing_evidence")
         self.assertEqual(result.kind, "insufficient_knowledge")
+        self.assertEqual(core.selector._json_response.await_count, 2)
 
     def test_generated_validator_rejects_nonanswer_claims(self):
         result = ConsultationResult(kind="clarify", answer_text="Цена 500 рублей. Какой объект?", reason_code="missing_material_context")

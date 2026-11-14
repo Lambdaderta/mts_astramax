@@ -9,13 +9,16 @@ from pathlib import Path
 from .corpus import Corpus
 from .grounding import (
     CLARIFY_RESPONSES, MAX_ANSWER_WORDS, MAX_EXCERPT_CHARACTERS, SAFE_RESPONSES,
-    UNTRUSTED_INSTRUCTIONS, render_excerpts, validate_generated_result, validate_result,
+    UNTRUSTED_INSTRUCTIONS, is_verbatim_supported, render_excerpts, validate_generated_result, validate_result,
 )
 from .llm_client import EvidenceSelector, LLMConfig
 from .embeddings import EmbeddingConfig, EmbeddingProvider, EmbeddingUnavailable, OpenAIEmbeddingClient
 from .hybrid import HybridRetriever
 from .retrieval_config import RetrievalConfig
-from .protocol import ConsultationRequest, ConsultationResult, CorpusNotReady, Evidence, InvalidEvidence
+from .protocol import (
+    ConsultationRequest, ConsultationResult, ConsultationUnavailable, CorpusNotReady,
+    Evidence, InvalidEvidence, InvalidModelOutput,
+)
 from .retriever import BM25Retriever, SearchHit, tokens
 
 CONTACT_PATTERN = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|\+\d[\d ()-]{5,}\d|(?<!\d)[78](?:[ ()-]*\d){10}(?!\d)")
@@ -165,7 +168,7 @@ class LocalConsultationCore:
 
     async def consult(self, request: ConsultationRequest) -> ConsultationResult:
         started = time.perf_counter()
-        timings = dict.fromkeys(("retrieval", "rerank", "generation", "validation"), 0.0)
+        timings = dict.fromkeys(("retrieval", "rerank", "generation", "review", "validation"), 0.0)
         latest, context = _query_parts(request)
         query = f"{latest}\nКонтекст:\n{context}" if context else latest
         mode = self.selector.config.generation_mode if self.selector else "extractive"
@@ -194,9 +197,9 @@ class LocalConsultationCore:
 
         if INJECTION.search(latest) or DOCUMENT_DUMP.search(latest):
             return result("insufficient_knowledge", SAFE_RESPONSES["injection"], "untrusted_instruction")
-        if OUT_OF_SCOPE.search(latest):
+        if mode != "grounded" and OUT_OF_SCOPE.search(latest):
             return result("out_of_scope", SAFE_RESPONSES["scope"], "outside_scope")
-        if BILL_CHANGE.search(latest) and not BILL_DETAILS.search(latest + " " + context):
+        if mode != "grounded" and BILL_CHANGE.search(latest) and not BILL_DETAILS.search(latest + " " + context):
             return result("clarify", SAFE_RESPONSES["bill"], "missing_material_context")
         if not tokens(latest) or (len(tokens(latest)) < 2 and not context) or re.fullmatch(r"\s*(?:привет|здравствуйте|добрый день|помогите)[.!?\s]*", latest, re.I):
             return result("clarify", SAFE_RESPONSES["clarify"], "missing_material_context")
@@ -230,22 +233,65 @@ class LocalConsultationCore:
             and not UNTRUSTED_INSTRUCTIONS.search(hit.chunk.title + "\n" + hit.chunk.text)
         ]
         timings["retrieval"] = (time.perf_counter() - retrieval_start) * 1000
-        if _conflicting_prices(candidates, latest, context):
+        potential_price_conflict = _conflicting_prices(candidates, latest, context)
+        if mode != "grounded" and potential_price_conflict:
             return result("insufficient_knowledge", SAFE_RESPONSES["conflict"], "conflicting_evidence")
 
         if self.selector and mode == "grounded":
             generation_start = time.perf_counter()
             remaining = request.timeout_budget_ms - (generation_start - started) * 1000
+            selected = candidates[:self.retrieval_config.top_k]
+            if not selected:
+                return result("insufficient_knowledge", SAFE_RESPONSES["missing"], "missing_evidence")
+            generated = None
+            # Reserve time for one source review or structured-output recovery.
+            # No extra retrieval, model or unbounded repair loop is introduced.
             try:
-                generated = await self.selector.generate(query, request, candidates[:self.retrieval_config.top_k], remaining)
+                generated = await self.selector.generate(query, request, selected, remaining * 0.8)
+            except ConsultationUnavailable:
+                retrieval_metadata["initial_output_error"] = "model_unavailable"
+            except InvalidModelOutput as error:
+                retrieval_metadata["initial_output_error"] = error.code
             except InvalidEvidence:
-                timings["generation"] = (time.perf_counter() - generation_start) * 1000
-                return result("insufficient_knowledge", SAFE_RESPONSES["invalid"], "invalid_generated_evidence")
+                retrieval_metadata["initial_output_error"] = "invalid_generated_evidence"
             timings["generation"] = (time.perf_counter() - generation_start) * 1000
+            direct = False
+            if generated is not None and generated.kind == "answer":
+                try:
+                    direct = is_verbatim_supported(generated, self.corpus) and not potential_price_conflict
+                except InvalidEvidence:
+                    pass  # The source reviewer can correct an invalid draft.
+            if direct:
+                retrieval_metadata["answer_review"] = "verbatim"
+            else:
+                review_start = time.perf_counter()
+                remaining = request.timeout_budget_ms - (review_start - started) * 1000
+                review_failure = None
+                try:
+                    reviewed = await self.selector.review(query, request, selected, remaining, draft=generated)
+                    if reviewed.kind == "answer":
+                        self.validate_result(reviewed)
+                except ConsultationUnavailable:
+                    retrieval_metadata["answer_review"] = "unavailable"
+                    review_failure = "answer_review_unavailable"
+                except InvalidModelOutput as error:
+                    retrieval_metadata["answer_review"] = "invalid"
+                    review_failure = error.code
+                except InvalidEvidence:
+                    retrieval_metadata["answer_review"] = "invalid"
+                    review_failure = "answer_review_invalid"
+                finally:
+                    timings["review"] = (time.perf_counter() - review_start) * 1000
+                if review_failure:
+                    return result("insufficient_knowledge", SAFE_RESPONSES["invalid"], review_failure)
+                retrieval_metadata["answer_review"] = "recovered" if generated is None else "corrected_or_confirmed"
+                generated = reviewed
             if generated.kind == "answer":
                 return result("answer", generated.answer_text, generated.reason_code, generated.evidence)
             if generated.kind == "clarify":
                 question = CLARIFY_RESPONSES.get(generated.answer_text, CLARIFY_RESPONSES["generated_clarify"])
+                if generated.answer_text in CLARIFY_RESPONSES.values():
+                    question = generated.answer_text
                 if any(message.role == "assistant" and message.text == question for message in request.messages[-5:]):
                     return result("insufficient_knowledge", SAFE_RESPONSES["missing"], "missing_evidence")
                 return result("clarify", question, generated.reason_code)

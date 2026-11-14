@@ -2,9 +2,9 @@
 
 The core loads an explicitly supplied knowledge base, retrieves source chunks,
 and returns a typed `ConsultationResult`. The local mode uses lexical retrieval
-and short source excerpts. With a configured provider, the model selects
-supporting statements or returns a decision to clarify, abstain, or route an
-out-of-scope request. The same core serves the web backend and `solution.py`.
+and short source excerpts. With a configured provider, the model synthesizes
+source-backed answers or decides to clarify, abstain, or route an out-of-scope
+request. The same core serves the web backend and `solution.py`.
 
 ## Local ingestion
 
@@ -69,24 +69,42 @@ for the caller to manage.
 ## Answer validation
 
 In grounded mode, the provider returns `kind`, `answer_text`, and `chunk_ids`.
-Each factual sentence must match wording in a supplied source, with limited
-normalization of whitespace and ruble notation. The validator checks the full
-chunk against the loaded index, groups recognizable standalone qualifications
-with their claim, and rejects unsupported wording, reversed roles, unsupported
-prices and units, economic guarantees, unrelated citations, and complete
-multi-statement copies. The customer receives at most 150 words. Full evidence
-is available through the authorized review trace. The provider can select a
-specific local clarification question. An unsupported or repeated question
-uses a local safe response. Invalid model output yields a short explanation and
-an offer to contact a specialist.
+The synchronous validator checks known source IDs, unchanged full evidence
+quotes, output bounds and explicit economic guarantees. It does not claim to
+prove semantic entailment. Paraphrasing, source-backed synthesis, table-to-prose
+and complete short passages are allowed. The prompt targets 150 words, allowing
+more when needed for a complete answer; exceeding the recommendation no longer
+discards a supported answer. The typed result retains its 8,000-character bound,
+below the platform's 10,000-character maximum. Long drafts must pass source review.
 
-This design favors evidence preservation over free paraphrase. Hybrid retrieval
-and sentence matching cannot establish factual correctness or all dependencies
-between sections or documents. Tables that need selected rows or interpretation
-can lead to abstention. Price conflicts are screened for matching query terms
-and normalized ruble amounts. Corpus-level precedence and non-price conflicts
-still require evaluation. End-to-end organizer model quality and latency require
-live access.
+Complete source statements, with their adjacent qualifications, can pass
+directly. Harmless list/emphasis formatting is normalized without erasing
+numeric signs. Other drafts receive one source-review-and-correction call to
+the same provider. The reviewer sees the question, redacted dialogue, all
+retrieved candidates and the draft; it checks numbers, units, polarity,
+conditions, compatibility and missing answer parts. An initial invalid output
+or unavailable generation can use this second call to recover without a draft.
+There are at most two completion calls, with transport retries bounded by each
+call's budget. Generation gets 80% of the remaining consultation budget, also
+capped by the configured provider timeout; review uses the time actually left.
+Failed review produces a recorded fallback, never an unreviewed synthesized
+answer. Full evidence remains available through the authorized review trace.
+
+Different price amounts are a reason for contextual review, not an automatic
+refusal: they may describe different configurations. Potential price conflicts
+disable the direct-quotation shortcut. Billing and scope decisions in grounded
+mode also use the question and sources instead of broad regex preemption.
+The model should answer supported parts, ask only materially necessary
+clarifications and avoid a routine specialist handoff when the answer is known.
+Offline/extractive behavior remains unchanged. Clarifications still use local
+vetted questions, accepting either their key or exact text.
+
+The source review is a model judgment, not a formal guarantee of correctness.
+It adds a completion call for synthesized answers and may still reject valid
+answers or miss unsupported claims. Live accuracy, latency, throughput and
+score remain unmeasured. The private preservation benchmark supplies reviewed
+answers and relevant passages to isolate post-processing; it does not test
+the generator, reviewer or retrieval quality.
 
 The offline baseline renders a complete short chunk with a fixed introduction
 and closing. Use it for local testing and provenance checks. It abstained on most
@@ -113,14 +131,17 @@ Only transport errors, HTTP 429 and HTTP 5xx are retried. Typed unavailability
 allows the web API to record a retryable turn failure and the platform adapter
 to return a safe fallback. Provider errors do not expose credentials or bodies.
 Valid gzip/deflate responses are decoded by httpx and checked against the same
-decoded-byte limits. Malformed completion envelopes become controlled invalid
-evidence responses. Platform generation defaults to 90 seconds, versus 10
-seconds for the web service, and remains bounded by the remaining request budget.
+decoded-byte limits. Malformed envelopes, truncated output and invalid citation
+IDs have separate sanitized error codes. Platform completion calls default to
+90 seconds, versus 10 seconds for the web service, and share the original
+consultation deadline. Submission summaries distinguish substantive answers,
+legitimate abstentions, model/output failures and unprocessed cases. Rejected
+generated answers count as failures instead of being hidden behind a valid CSV.
 
 | Setting | Starting value | Meaning |
 | --- | --- | --- |
 | `TEMPERATURE` | `0` | Organizer sample baseline; not a measured optimum |
-| `MAX_TOKENS` | `2048` | Generation budget; the current answer contract is still 150 words |
+| `MAX_TOKENS` | `2048` | Per-completion budget; the prompt normally targets 150 words |
 | `MAX_WORKERS` | `3` | Parallel questions in the platform adapter |
 | `RETRIEVAL_MODE` | `hybrid` with generation, otherwise `bm25` | Retrieval ablation switch |
 | `TOP_K` | `6` | Maximum passages sent to grounded generation; supported range 1..30 |
@@ -144,8 +165,8 @@ for generation. Qwen's upstream card also describes `top_p`, sampling `top_k`,
 thinking controls and `reasoning_effort`, but proxy acceptance is unverified.
 These are not sent automatically. Start with the sample's documented generation
 settings, then compare answer quality, truncation, failures and latency on the
-actual proxy. Increasing `MAX_TOKENS` alone does not increase the 150-word answer
-limit; a later answer-length experiment must change prompt and validator together.
+actual proxy. `MAX_TOKENS` is a completion budget, not a requested answer length;
+length experiments should change the prompt's target and measure actual lengths.
 
 ## Retrieval evaluation
 

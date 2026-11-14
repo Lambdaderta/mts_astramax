@@ -65,6 +65,9 @@ def test_dense_only_relevant_passage_reaches_generator_and_trace(tmp_path):
             captured.extend(candidates)
             return ConsultationResult(kind="insufficient_knowledge", answer_text="Нет сведений.", reason_code="missing_evidence")
 
+        async def review(self, query, request, candidates, remaining, draft=None):
+            return draft
+
     core.selector = Selector()
     request = ConsultationRequest(request_id="r", session_id="s", user_message_id="u", latest_user_text=query,
                                   corpus_version=corpus.version, timeout_budget_ms=1000)

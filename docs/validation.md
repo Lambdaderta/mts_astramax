@@ -2,6 +2,65 @@
 
 Updated 14 November 2026. This record separates the current development checks from results recorded on 13 November. Historical results describe the code and environment tested at that time; they are not a claim that the latest code was rerun in every earlier environment.
 
+## 14 November: v3 answer-quality correction
+
+The user reported that the organizers caused the earlier generic scoring error,
+and that v2's best score was **0.0319**, compared with a reported leader score
+of **0.75**. No platform output, logs or per-case feedback is available. Local
+reproductions identify concrete defects but do not establish their frequency
+in that hidden run.
+
+The old gate rejected valid paraphrases, table-to-prose answers, harmless list
+formatting and complete short source passages. It could replace a correctly
+retrieved and source-supported SIM-card answer with a generic refusal while
+reporting `fallbacks=0`. Separate probes reproduced billing questions preempted
+before retrieval and unrelated/configuration-specific price amounts treated
+as automatic contradictions. These policies were stricter than the supplied
+case and team specification.
+
+The v3 candidate separates source identity from semantic review. It preserves
+known source IDs and full evidence quotes but allows natural synthesis. Complete
+source statements can pass directly; other drafts receive one bounded
+source-review/correction call using the same provider and retrieved candidates.
+Potential price conflicts always require contextual review. An invalid or
+unavailable first completion can use the second call to recover. The source
+review can correct a claim, answer a previously omitted supported part, or
+abstain. A failed review does not release an unreviewed synthesized draft.
+
+Grounded billing and scope decisions now use the question and source context.
+The prompt requests direct, complete answers, preserving conditions and user
+corrections without a routine specialist handoff. The 150-word recommendation
+is a target rather than an automatic refusal threshold. Answers over that
+target require review; the existing 8,000-character typed bound remains below
+the platform's 10,000-character maximum. Offline/extractive behavior is unchanged.
+Retrieval, chunking, embedding model, temperature and token-budget defaults are
+unchanged. New sanitized counters distinguish substantive answers, legitimate
+abstentions, processing failures and unprocessed cases.
+
+Verification:
+
+| Check | Result | What it establishes |
+| --- | --- | --- |
+| Final local regression suite, Python 3.12.14 | **317 passed, 7 skipped**, 10.10 s | Includes 42 submission tests. PostgreSQL integration remains skipped without a configured server; one existing Starlette/AnyIO warning. |
+| Extracted-ZIP review tests | Passed | A paraphrase survives both calls; malformed generation recovers once; invalid review emits a valid CSV with accurate failure counters. Exactly two completion calls, identical retrieved sources and no sensitive log text are checked. |
+| Private source-reviewed answer preservation fixture | v2 **0/18** preserved; v3 **18/18** preserved | Same supporting passages and assistant-authored natural answers supplied to both versions. v2 produced 17 refusals and one clarification. This isolates post-processing: model generation/review is scripted and retrieval is replaced by the supplied evidence. It is **not** an answer-accuracy result, live Qwen test, organizer gold or predicted score. |
+| Isolated dependency execution of final v3 ZIP | **16/16 valid CSV scenarios** | Fresh local Python 3.12 environment exposes only the three pinned ZIP dependencies and their nine required transitive packages, linked from installed distributions. Synthetic local HTTP tests include aliases/placeholders, malformed/compressed responses, failures and an 11-second completion. macOS arm64, not a Linux container. |
+| Archive structure, compilation and diff whitespace | Passed | 14 root files, declared allowed dependencies, no corpus, labels, model weights or credentials. |
+
+The private preservation fixtures contain all 18 demo questions, source IDs and
+manually checked answers of 12–69 words. Fixture SHA-256:
+`5978bc1c8cffcb56da40a50f03108b90a69eb26aa66911c494c53e9ea44b1bc5`.
+The final ZIP SHA-256 is
+`f3d0eaa68ba97a4534d00e1e87d16579d3b0b516f0eaecb22f5497cc1670abcb`.
+Private detailed reports and fixtures stay outside the repository and package.
+
+Remaining uncertainty: semantic review is another model judgment and adds one
+completion call for synthesized answers. Both calls share the original request
+deadline, with at most 80% of the remaining budget given to initial generation
+(also capped by the provider timeout). Live latency, throughput, reviewer
+accuracy, rejection rate and competition score are unmeasured. Docker was not
+available for this pass; the earlier Linux checks below apply only to v2.
+
 ## 14 November: scoring-error investigation and corrected ZIP
 
 The first uploaded archive received the platform message “Ошибка скоринга сабмита. Попробуйте позже”. No run ID, logs or stage details were exposed. A fresh fetch found no changes to the official regulation, sample ZIP or allowed dependency list. The generic message is not documented, so it does not establish whether failure occurred during execution, CSV validation or judging.
@@ -120,6 +179,6 @@ On a warm container, **36 sequential HTTP turns** using local BM25 and SQLite ha
 
 - Validate retrieval on the organizer's embedding model; the measured improvement above uses local E5 development data. Extend and independently review labels before treating it as a generalization result.
 - Measure Qwen answers and latency through the organizer's proxy, verify its service limits and obtain an actual platform score. The local test proxy covers HTTP behavior, network failures and the overall response-time budget only.
-- Review product selection, conflicting sources and conditions carried between documents. Text grounding requires close source wording and may reject valid paraphrases.
+- Measure v3 source-review quality, latency and false refusals on the actual model. Deterministic provenance checks do not establish semantic support, and the preservation fixture does not evaluate live generation or review.
 - Check compatibility with an existing frontend if the team has a separate original contract bundle. Current API schemas are checked against the code; full AT-01–AT-20 acceptance requires the interface and model access.
 - Collect counters and distributions in the deployment environment. The backend emits structured stage/timing events; a separate metrics collector is not connected.

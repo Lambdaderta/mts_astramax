@@ -51,6 +51,16 @@ DIALOGUE_LABEL = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 USER_LABELS = {"пользователь", "клиент", "user", "human"}
+GENERATED_OUTPUT_FAILURES = {
+    "invalid_model_output", "model_output_truncated", "invalid_model_evidence",
+    "invalid_generated_evidence", "answer_review_unavailable", "answer_review_invalid", "invalid_evidence",
+}
+DIAGNOSTIC_REASONS = GENERATED_OUTPUT_FAILURES | {
+    "grounded_answer", "grounded_excerpt", "missing_evidence", "missing_material_context",
+    "outside_scope", "untrusted_instruction", "conflicting_evidence", "corpus_unavailable",
+    "manager_requested", "invalid_question", "model_unavailable", "case_timeout", "total_timeout",
+    "invalid_output", "unexpected_error",
+}
 
 
 class SubmissionError(ValueError):
@@ -204,14 +214,20 @@ async def answer_questions(
     questions: list[Question], core, *, workers: int = 3,
     case_timeout_seconds: float = 120, total_timeout_seconds: float = 1080,
     retrieval_counts: dict[str, int] | None = None,
+    stats: dict[str, dict[str, int]] | None = None,
 ) -> tuple[list[tuple[str, str]], int]:
+    """Return output rows and the number caused by execution/output failures.
+
+    Legitimate clarification, abstention, scope and handoff decisions are not
+    failures. Rejected model output and cases left by the deadline are failures.
+    Optional stats receives text-free outcome, reason and failure histograms.
+    """
     deadline = time.monotonic() + total_timeout_seconds
     answers = [(question.id, FAILURE_ANSWER) for question in questions]
-    failures = len(questions)
+    outcomes = [("not_processed", "total_timeout", True) for _ in questions]
     pending = iter(enumerate(questions))
 
     async def worker() -> None:
-        nonlocal failures
         for index, question in pending:
             remaining = min(case_timeout_seconds, deadline - time.monotonic())
             if remaining <= 0:
@@ -222,10 +238,11 @@ async def answer_questions(
                 except ValueError:
                     # Do not guess a user question from a malformed role transcript.
                     answers[index] = question.id, INVALID_QUESTION_ANSWER
+                    outcomes[index] = "clarify", "invalid_question", True
                     continue
                 if manager_requested(request.latest_user_text):
                     answers[index] = question.id, CONTACT_REQUEST_ANSWER
-                    failures -= 1
+                    outcomes[index] = "handoff", "manager_requested", False
                     continue
                 async with asyncio.timeout(min(remaining, deadline - time.monotonic())):
                     result = await core.consult(request)
@@ -236,7 +253,17 @@ async def answer_questions(
                 text = result.answer_text.strip()
                 if not text or len(text) > MAX_ANSWER_CHARACTERS:
                     raise InvalidEvidence("Invalid output length")
-            except (ConsultationUnavailable, InvalidEvidence, ValueError, TimeoutError):
+            except ConsultationUnavailable:
+                outcomes[index] = "error", "model_unavailable", True
+                continue
+            except InvalidEvidence:
+                outcomes[index] = "error", "invalid_generated_evidence", True
+                continue
+            except ValueError:
+                outcomes[index] = "error", "invalid_output", True
+                continue
+            except TimeoutError:
+                outcomes[index] = "error", "case_timeout", True
                 continue
             except Exception as error:
                 # Isolate unexpected provider/core errors to their case. Error
@@ -245,11 +272,21 @@ async def answer_questions(
                     f"Submission case failed: phase=case_failed; case_index={index + 1}; "
                     f"exception_type={type(error).__name__}.", file=sys.stderr, flush=True,
                 )
+                outcomes[index] = "error", "unexpected_error", True
                 continue
             answers[index] = question.id, text
-            failures -= 1
+            reason = result.reason_code if result.reason_code in DIAGNOSTIC_REASONS else "other"
+            outcomes[index] = result.kind, reason, reason in GENERATED_OUTPUT_FAILURES or reason == "corpus_unavailable"
 
     await asyncio.gather(*(worker() for _ in range(min(workers, len(questions)))))
+    failures = sum(failed for _, _, failed in outcomes)
+    if stats is not None:
+        stats.update({"outcomes": {}, "reasons": {}, "failures": {}})
+        for outcome, reason, failed in outcomes:
+            stats["outcomes"][outcome] = stats["outcomes"].get(outcome, 0) + 1
+            stats["reasons"][reason] = stats["reasons"].get(reason, 0) + 1
+            if failed:
+                stats["failures"][reason] = stats["failures"].get(reason, 0) + 1
     return answers, failures
 
 
@@ -316,6 +353,7 @@ def run_submission(data_dir: Path, output: Path, *, offline: bool = False) -> di
             file=sys.stderr, flush=True,
         )
         retrieval_counts: dict[str, int] = {}
+        stats: dict[str, dict[str, int]] = {}
         async def execute():
             remaining = total_timeout - (time.monotonic() - started)
             await core.prepare_retrieval(timeout_budget_ms=max(1, int(min(120, remaining * 0.25) * 1000)))
@@ -329,10 +367,18 @@ def run_submission(data_dir: Path, output: Path, *, offline: bool = False) -> di
                 case_timeout_seconds=case_timeout,
                 total_timeout_seconds=total_timeout - (time.monotonic() - started),
                 retrieval_counts=retrieval_counts,
+                stats=stats,
             )
         answers, failures = asyncio.run(execute())
+        def format_counts(counts: dict[str, int]) -> str:
+            return ",".join(f"{name}:{count}" for name, count in sorted(counts.items())) or "none"
+        outcome_counts = format_counts(stats.get("outcomes", {}))
+        reason_counts = format_counts(stats.get("reasons", {}))
+        failure_counts = format_counts(stats.get("failures", {}))
+        substantive_answers = stats.get("outcomes", {}).get("answer", 0)
         print(
-            f"Submission generation complete: answers={len(answers)}; fallbacks={failures}.",
+            f"Submission generation complete: rows={len(answers)}; substantive_answers={substantive_answers}; "
+            f"fallbacks={failures}; outcomes={outcome_counts}; reasons={reason_counts}; failures={failure_counts}.",
             file=sys.stderr, flush=True,
         )
         if [identifier for identifier, _ in answers] != [question.id for question in questions]:
@@ -345,6 +391,8 @@ def run_submission(data_dir: Path, output: Path, *, offline: bool = False) -> di
     return {
         "questions": len(questions), "documents": document_count,
         "fallbacks": failures, "mode": "offline" if offline else "platform-model",
+        "substantive_answers": substantive_answers,
+        "outcome_counts": outcome_counts, "reason_counts": reason_counts, "failure_counts": failure_counts,
         "retrieval": actual_retrieval,
         "configured_retrieval": core.retrieval_config.mode,
         "retrieval_fallback": core._prepare_failure or "none",
@@ -370,9 +418,11 @@ def main(argv=None) -> int:
         print("Submission failed: check input files, model environment and supported dependencies.", file=sys.stderr, flush=True)
         return 2
     print(
-        f"Wrote submission.csv: {result['questions']} answers; "
+        f"Wrote submission.csv: {result['questions']} rows; "
         f"{result['documents']} documents; mode={result['mode']}; "
-        f"fallbacks={result['fallbacks']}; retrieval={result['retrieval']}; "
+        f"substantive_answers={result['substantive_answers']}; fallbacks={result['fallbacks']}; "
+        f"outcomes={result['outcome_counts']}; reasons={result['reason_counts']}; failures={result['failure_counts']}; "
+        f"retrieval={result['retrieval']}; "
         f"configured_retrieval={result['configured_retrieval']}; "
         f"startup_retrieval_fallback={result['retrieval_fallback']}; "
         f"retrieval_counts={result['retrieval_counts']}.", file=sys.stderr, flush=True,

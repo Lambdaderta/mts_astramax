@@ -1,4 +1,8 @@
-"""Validate user-visible answers against complete chunks from the loaded corpus."""
+"""Validate answer provenance; identify literal answers that need no model review.
+
+Source identity is checked deterministically. Natural-language entailment is
+handled by the consultation's source-review pass, not by string similarity.
+"""
 from __future__ import annotations
 
 import re
@@ -53,7 +57,9 @@ _CONDITION = re.compile(
 _RUBLES = re.compile(r"(?<=\d)\s*(?:₽|руб(?:ль|ля|лей|\.)?)(?!\w)", re.IGNORECASE)
 _GUARANTEE = re.compile(r"гарантир|гаранти\w*", re.IGNORECASE)
 _ECONOMIC_RESULT = re.compile(r"эконом|снижен|окупаем", re.IGNORECASE)
-_DENIED_GUARANTEE = re.compile(r"\b(?:не|без|нет)\s+(?:\w+\s+){0,2}гарантир|\b(?:нет|без)\s+гаранти", re.IGNORECASE)
+_DENIED_GUARANTEE = re.compile(
+    r"\b(?:не|без|нет|нельзя|невозможно)\s+(?:\w+\s+){0,2}гарант", re.IGNORECASE,
+)
 _SAFE_CLOSINGS = {
     "могу помочь подготовить обращение специалисту",
     "предлагаю подготовить обращение специалисту",
@@ -65,8 +71,8 @@ def render_excerpts(quotes: list[str]) -> str:
     return ANSWER_PREFIX + "\n\n".join("«" + quote + "»" for quote in quotes) + ANSWER_SUFFIX
 
 
-def _safe_answer(text: str) -> None:
-    if not text.strip() or len(text.split()) > MAX_ANSWER_WORDS:
+def _safe_answer(text: str, *, max_words: int | None = MAX_ANSWER_WORDS) -> None:
+    if not text.strip() or (max_words is not None and len(text.split()) > max_words):
         raise InvalidEvidence("Answer exceeds the consultation length limit or is empty")
     if UNTRUSTED_INSTRUCTIONS.search(text):
         raise InvalidEvidence("Answer contains instruction-like text")
@@ -75,8 +81,8 @@ def _safe_answer(text: str) -> None:
             raise InvalidEvidence("Answer promises a guaranteed economic result")
 
 
-def _validated_quotes(result: ConsultationResult, corpus: Corpus | None) -> list[str]:
-    _safe_answer(result.answer_text)
+def _validated_quotes(result: ConsultationResult, corpus: Corpus | None, *, max_words: int | None = MAX_ANSWER_WORDS) -> list[str]:
+    _safe_answer(result.answer_text, max_words=max_words)
     if result.recommended_products or result.fact_updates:
         raise InvalidEvidence("Local core cannot propose products or customer facts")
     if result.kind != "answer":
@@ -109,6 +115,9 @@ def validate_result(result: ConsultationResult, corpus: Corpus | None) -> None:
 def _normalize(text: str) -> str:
     text = _RUBLES.sub(" ₽", text)
     text = re.sub(r"(?<=\d)[\u00a0\u202f](?=\d)", " ", text)
+    # A leading +/- before a number can be its sign, not a list marker.
+    text = re.sub(r"(?m)^[ \t]*(?:[-*+][ \t]+(?=[^\d\s])|\d+[.)][ \t]+)", "", text)
+    text = text.replace("**", "").replace("__", "")
     return " ".join(text.strip(' \t\r\n.«»\"').split())
 
 
@@ -126,22 +135,32 @@ def _source_units(quote: str) -> set[str]:
 
 
 def validate_generated_result(result: ConsultationResult, corpus: Corpus | None) -> None:
-    """Allow verbatim claims and limited formatting changes, with a vetted closing."""
-    quotes = _validated_quotes(result, corpus)
-    if not quotes:
-        return
+    """Check provenance and bounds without pretending to prove semantic support.
+
+    The async core reviews synthesized answers against their sources. Its callers
+    can repeat this deterministic check without making another model request.
+    """
+    # The organizer recommends 150 words; the typed result retains the existing
+    # 8,000-character safety bound (below the platform's 10,000-character limit).
+    _validated_quotes(result, corpus, max_words=None)
+
+
+def is_verbatim_supported(result: ConsultationResult, corpus: Corpus | None) -> bool:
+    """Fast path for complete source statements, including their qualifications.
+
+    False means a semantic review is needed, never that the answer is incorrect.
+    Short complete passages and harmless list formatting are valid answers.
+    """
+    quotes = _validated_quotes(result, corpus, max_words=None)
+    if not quotes or len(result.answer_text.split()) > MAX_ANSWER_WORDS:
+        return False
     if _normalize(result.answer_text) in {_normalize(quote) for quote in quotes}:
-        if len(_source_units(result.answer_text)) > 1:
-            raise InvalidEvidence("Generated answer must select supporting statements, not reproduce a complete multi-statement chunk")
-        return
+        return True
     claims = {
         claim for claim in _source_units(result.answer_text.removeprefix(ANSWER_PREFIX))
         if claim.casefold() not in _SAFE_CLOSINGS
     }
     source_units = [_source_units(quote) for quote in quotes]
-    if not claims or not claims.issubset(set().union(*source_units)):
-        raise InvalidEvidence("Generated claim lacks matching text in its cited sources")
-    if any(not units.intersection(claims) for units in source_units):
-        raise InvalidEvidence("Generated answer cites evidence without using it")
-    if any(len(units) > 1 and units.issubset(claims) for units in source_units):
-        raise InvalidEvidence("Generated answer reproduces a complete multi-statement chunk")
+    return bool(claims) and claims.issubset(set().union(*source_units)) and all(
+        units.intersection(claims) for units in source_units
+    )

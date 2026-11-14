@@ -71,6 +71,19 @@ class InvalidEvidence(ValueError):
     """A result failed the corpus/evidence/claim validation gate."""
 
 
+class InvalidModelOutput(InvalidEvidence):
+    """A sanitized, machine-readable model completion or citation failure."""
+
+    def __init__(self, code: str = "invalid_model_output"):
+        messages = {
+            "model_output_truncated": "The model did not finish its answer within the output budget",
+            "invalid_model_output": "The model returned an invalid structured answer",
+            "invalid_model_evidence": "The model returned invalid source references",
+        }
+        self.code = code if code in messages else "invalid_model_output"
+        super().__init__(messages[self.code])
+
+
 class ConsultationCore(Protocol):
     ready: bool
     corpus_version: str
