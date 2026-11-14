@@ -13,7 +13,7 @@ from app.ml.retrieval_config import RetrievalConfig
 
 
 def test_config_rejects_nonfinite_or_inconsistent_limits(monkeypatch):
-    for key, value in [("TOP_K", "0"), ("TOP_K", "13"), ("RRF_K", "nan"),
+    for key, value in [("TOP_K", "0"), ("TOP_K", "31"), ("RRF_K", "nan"),
                        ("DENSE_WEIGHT", "inf"), ("RETRIEVAL_MODE", "typo")]:
         with monkeypatch.context() as isolated:
             isolated.setenv(key, value)

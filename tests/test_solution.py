@@ -28,7 +28,7 @@ SYNTHETIC = (
     "Эти сведения не относятся к реальным продуктам Energytool."
 )
 MODEL_ENV = {
-    "LLM_BASE_URL", "OPENAI_BASE_URL", "LLM_API_KEY", "OPENAI_API_KEY",
+    "LLM_BASE_URL", "BASE_URL", "OPENAI_BASE_URL", "LLM_API_KEY", "OPENAI_API_KEY",
     "LLM_MODEL", "OPENAI_MODEL", "GEN_MODEL", "LLM_GENERATION_MODE",
     "TEMPERATURE", "MAX_TOKENS", "ML_TIMEOUT_SECONDS", "LLM_MAX_RETRIES",
     "DATA_DIR", "MAX_WORKERS", "CONSULTATION_TIMEOUT_SECONDS", "SUBMISSION_TIMEOUT_SECONDS",
@@ -84,10 +84,12 @@ def test_csv_round_trip_and_atomic_validation(tmp_path):
     answer = 'Ответ с запятой, "кавычками"\nи новой строкой.'
     solution.write_submission(output, [("1", answer)])
     assert csv_answers(output) == [{"id": "1", "answer": answer}]
+    assert stat.S_IMODE(output.stat().st_mode) == 0o644
     original = output.read_bytes()
     with pytest.raises(solution.SubmissionError):
         solution.write_submission(output, [("1", "x" * 10001)])
     assert output.read_bytes() == original
+    assert stat.S_IMODE(output.stat().st_mode) == 0o644
     assert not list(tmp_path.glob("*.tmp"))
 
 
@@ -139,6 +141,44 @@ def test_cases_never_share_context_and_output_order_is_stable():
     assert failures == 0
     assert len({request.session_id for request in core.requests}) == 2
     assert all(len(request.messages) == 1 for request in core.requests)
+
+
+def test_unexpected_case_failure_preserves_all_output_ids_and_hides_error_body(tmp_path, capsys):
+    class FailingCore:
+        corpus_version = "synthetic"
+
+        async def consult(self, request):
+            if "first" in request.latest_user_text:
+                raise RuntimeError("synthetic-secret-token and private-source-text")
+            return ConsultationResult(kind="clarify", answer_text="Уточните задачу.", reason_code="test")
+
+        def validate_result(self, result):
+            pass
+
+    questions = [solution.Question("0001", "first synthetic question"), solution.Question("a,b", "second synthetic question")]
+    answers, failures = asyncio.run(solution.answer_questions(questions, FailingCore(), workers=1))
+    output = tmp_path / "submission.csv"
+    solution.write_submission(output, answers)
+    assert failures == 1
+    assert csv_answers(output) == [
+        {"id": "0001", "answer": solution.FAILURE_ANSWER},
+        {"id": "a,b", "answer": "Уточните задачу."},
+    ]
+    captured = capsys.readouterr()
+    assert "phase=case_failed; case_index=1; exception_type=RuntimeError" in captured.err
+    assert "synthetic-secret-token" not in captured.out + captured.err
+    assert "private-source-text" not in captured.out + captured.err
+
+
+def test_case_cancellation_is_not_swallowed_as_a_fallback():
+    class CancelledCore:
+        corpus_version = "synthetic"
+
+        async def consult(self, request):
+            raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(solution.answer_questions([solution.Question("one", "Synthetic question")], CancelledCore()))
 
 
 def test_submission_budget_cancels_active_cases_and_leaves_fallbacks_for_queued_cases():
@@ -272,6 +312,67 @@ def test_packaging_is_root_only_deterministic_and_runs_without_app_package(tmp_p
     assert not (runtime / "app").exists()
 
 
+@pytest.mark.parametrize(("placement", "questions_name", "knowledge_name"), [
+    ("data_dir", "questions.csv", "knowledge-base.zip"),
+    ("data_dir", "train.csv", "knowledge_base.zip"),
+    ("script_relative", "questions.csv", "kb.zip"),
+    ("cwd", "train.csv", "knowledge-base.zip"),
+])
+def test_packaged_input_lookup_matches_official_sample(tmp_path, placement, questions_name, knowledge_name):
+    package_path = tmp_path / "submission.zip"
+    build_submission(package_path)
+    runtime = tmp_path / "runtime"
+    with ZipFile(package_path) as package:
+        package.extractall(runtime)
+    working = tmp_path / "working"
+    working.mkdir()
+    roots = {"data_dir": working / "inputs", "script_relative": runtime / "inputs", "cwd": working}
+    data = roots[placement]
+    data.mkdir(parents=True, exist_ok=True)
+    write_questions(data / questions_name, [("0001", "Соедините меня с менеджером, пожалуйста.")])
+    with ZipFile(data / knowledge_name, "w") as archive:
+        archive.writestr("synthetic.md", SYNTHETIC)
+    env = {**clean_env(), "DATA_DIR": "inputs"}
+    process = subprocess.run(
+        [sys.executable, str(runtime / "solution.py"), "--offline"],
+        cwd=working, env=env, capture_output=True, text=True, timeout=20,
+    )
+    assert process.returncode == 0, process.stderr
+    assert csv_answers(working / "submission.csv") == [{"id": "0001", "answer": solution.CONTACT_REQUEST_ANSWER}]
+    assert not (runtime / "submission.csv").exists()
+
+
+def test_input_lookup_prioritizes_data_dir_and_documented_names(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    working = tmp_path / "working"
+    working.mkdir()
+    for name in ("questions.csv", "train.csv"):
+        (data / name).write_text("synthetic", encoding="utf-8")
+        (working / name).write_text("synthetic", encoding="utf-8")
+    monkeypatch.chdir(working)
+    assert solution.find_input_file(data, "questions.csv", "train.csv") == data / "questions.csv"
+    (data / "questions.csv").unlink()
+    assert solution.find_input_file(data, "questions.csv", "train.csv") == data / "train.csv"
+
+
+def test_platform_case_budget_defaults_to_120_seconds(tmp_path, monkeypatch):
+    data = make_data(tmp_path / "data")
+    captured = {}
+
+    async def capture(questions, core, **kwargs):
+        captured.update(kwargs)
+        return [(question.id, "Уточните задачу.") for question in questions], 0
+
+    for name in MODEL_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CONSULTATION_TIMEOUT_SECONDS", "CONSULTATION_TIMEOUT_SECONDS")
+    monkeypatch.setattr(solution, "answer_questions", capture)
+    solution.run_submission(data, tmp_path / "submission.csv", offline=True)
+    assert captured["case_timeout_seconds"] == 120
+    assert 1070 < captured["total_timeout_seconds"] <= 1080
+
+
 @pytest.fixture
 def fake_proxy():
     requests = []
@@ -356,6 +457,38 @@ def test_packaged_official_csv_adapter_uses_model_aliases_and_independent_dialog
     dialogues = [json.loads(call["body"]["messages"][-1]["content"])["dialogue"] for call in generation_calls]
     assert sorted(len(dialogue) for dialogue in dialogues) == [1, 3]
     assert "synthetic-test-key" not in process.stderr + process.stdout
+
+
+@pytest.mark.parametrize("url_alias", ["BASE_URL", "OPENAI_BASE_URL"])
+def test_packaged_official_placeholders_use_aliases_and_defaults(tmp_path, fake_proxy, url_alias):
+    base_url, calls, _ = fake_proxy
+    package_path = tmp_path / "submission.zip"
+    build_submission(package_path)
+    runtime = tmp_path / "runtime"
+    with ZipFile(package_path) as package:
+        package.extractall(runtime)
+    make_data(runtime / "data")
+    # The organizer sample explicitly treats literal template names as unset.
+    env = {**clean_env(), **{name: name for name in MODEL_ENV if name != "PYTHONPATH"}}
+    env.update({url_alias: "  " + base_url + "  ", "OPENAI_API_KEY": "synthetic-test-key", "GEN_MODEL": "synthetic-generation"})
+    process = subprocess.run(
+        [sys.executable, "solution.py"], cwd=runtime, env=env, capture_output=True, text=True, timeout=20,
+    )
+    assert process.returncode == 0, process.stderr
+    assert [row["id"] for row in csv_answers(runtime / "submission.csv")] == ["single", "dialogue"]
+    assert "fallbacks=0" in process.stderr
+    assert "retrieval_counts=hybrid:2" in process.stderr
+    embedding_calls = [call for call in calls if call["path"].endswith("/embeddings")]
+    generation_calls = [call for call in calls if call["path"].endswith("/chat/completions")]
+    assert len(embedding_calls) == 3 and len(generation_calls) == 2
+    assert all(call["auth"] == "Bearer synthetic-test-key" for call in calls)
+    assert all(call["body"]["model"] == "baai/bge-m3" for call in embedding_calls)
+    assert all(call["body"]["model"] == "synthetic-generation" for call in generation_calls)
+    assert all(call["body"]["temperature"] == 0 and call["body"]["max_tokens"] == 2048 for call in generation_calls)
+    assert all(marker in process.stderr for marker in (
+        "Submission started", "Submission inputs ready", "Submission retrieval ready", "Submission generation complete", "Wrote submission.csv",
+    ))
+    assert all(value not in process.stderr + process.stdout for value in ("synthetic-test-key", base_url, SYNTHETIC_CLAIM))
 
 
 def test_provider_failure_still_emits_every_id_without_false_product_claim(tmp_path, fake_proxy, monkeypatch):

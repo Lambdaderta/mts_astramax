@@ -22,6 +22,7 @@ from zipfile import BadZipFile, ZipFile
 
 from app.ml.adapter import LLMConfig, build_core
 from app.ml.corpus import SUPPORTED_SUFFIXES, ingest
+from app.ml.environment import env_value
 from app.ml.protocol import (
     ConsultationRequest, ConsultationUnavailable, ContextMessage, InvalidEvidence,
 )
@@ -60,6 +61,21 @@ class SubmissionError(ValueError):
 class Question:
     id: str
     text: str
+
+
+def find_input_file(data_dir: Path, *names: str) -> Path:
+    """Match the organizer's DATA_DIR, script-relative and cwd lookup order.
+
+    Within each location the documented filename precedes compatibility names.
+    """
+    for root in (data_dir, Path(__file__).resolve().parent / data_dir, Path.cwd()):
+        for name in names:
+            path = root / name
+            if path.is_file():
+                return path
+    raise SubmissionError(
+        f"Could not find {' or '.join(names)} in DATA_DIR, script-relative DATA_DIR or the working directory"
+    )
 
 
 def read_questions(path: Path) -> list[Question]:
@@ -186,7 +202,7 @@ def consultation_request(question: Question, corpus_version: str, timeout_ms: in
 
 async def answer_questions(
     questions: list[Question], core, *, workers: int = 3,
-    case_timeout_seconds: float = 60, total_timeout_seconds: float = 1080,
+    case_timeout_seconds: float = 120, total_timeout_seconds: float = 1080,
     retrieval_counts: dict[str, int] | None = None,
 ) -> tuple[list[tuple[str, str]], int]:
     deadline = time.monotonic() + total_timeout_seconds
@@ -201,16 +217,16 @@ async def answer_questions(
             if remaining <= 0:
                 return
             try:
-                request = consultation_request(question, core.corpus_version, max(1, int(remaining * 1000)))
-            except ValueError:
-                # Do not guess a user question from a malformed role transcript.
-                answers[index] = question.id, INVALID_QUESTION_ANSWER
-                continue
-            if manager_requested(request.latest_user_text):
-                answers[index] = question.id, CONTACT_REQUEST_ANSWER
-                failures -= 1
-                continue
-            try:
+                try:
+                    request = consultation_request(question, core.corpus_version, max(1, int(remaining * 1000)))
+                except ValueError:
+                    # Do not guess a user question from a malformed role transcript.
+                    answers[index] = question.id, INVALID_QUESTION_ANSWER
+                    continue
+                if manager_requested(request.latest_user_text):
+                    answers[index] = question.id, CONTACT_REQUEST_ANSWER
+                    failures -= 1
+                    continue
                 async with asyncio.timeout(min(remaining, deadline - time.monotonic())):
                     result = await core.consult(request)
                 if retrieval_counts is not None:
@@ -221,6 +237,14 @@ async def answer_questions(
                 if not text or len(text) > MAX_ANSWER_CHARACTERS:
                     raise InvalidEvidence("Invalid output length")
             except (ConsultationUnavailable, InvalidEvidence, ValueError, TimeoutError):
+                continue
+            except Exception as error:
+                # Isolate unexpected provider/core errors to their case. Error
+                # messages may contain credentials or source text, so omit them.
+                print(
+                    f"Submission case failed: phase=case_failed; case_index={index + 1}; "
+                    f"exception_type={type(error).__name__}.", file=sys.stderr, flush=True,
+                )
                 continue
             answers[index] = question.id, text
             failures -= 1
@@ -247,6 +271,9 @@ def write_submission(path: Path, answers: list[tuple[str, str]]) -> None:
             writer.writerow(["id", "answer"])
             writer.writerows(answers)
             stream.flush()
+            # The platform may read this result from a separate grading user.
+            # Private corpus/index/cache files retain their existing permissions.
+            os.fchmod(stream.fileno(), 0o644)
             os.fsync(stream.fileno())
         os.replace(temporary, path)
     finally:
@@ -255,8 +282,8 @@ def write_submission(path: Path, answers: list[tuple[str, str]]) -> None:
 
 
 def environment_number(name: str, default: float, lower: float, upper: float, *, integer=False):
-    value = os.getenv(name, "").strip()
-    if not value or value == name:
+    value = env_value(name)
+    if not value:
         return int(default) if integer else default
     try:
         parsed = int(value) if integer else float(value)
@@ -271,22 +298,32 @@ def run_submission(data_dir: Path, output: Path, *, offline: bool = False) -> di
     started = time.monotonic()
     # Missing credentials are a configuration failure, never an implicit offline run.
     config = None if offline else LLMConfig.from_env(platform=True)
-    questions = read_questions(data_dir / "questions.csv")
+    questions = read_questions(find_input_file(data_dir, "questions.csv", "train.csv"))
+    knowledge_path = find_input_file(data_dir, "knowledge-base.zip", "knowledge_base.zip", "kb.zip")
     workers = environment_number("MAX_WORKERS", 3, 1, 8, integer=True)
-    case_timeout = environment_number("CONSULTATION_TIMEOUT_SECONDS", 60, 1, 120)
+    case_timeout = environment_number("CONSULTATION_TIMEOUT_SECONDS", 120, 1, 120)
     total_timeout = environment_number("SUBMISSION_TIMEOUT_SECONDS", 1080, 1, 1140)
     with tempfile.TemporaryDirectory(prefix="energytool-submit-") as temporary:
         working = Path(temporary)
-        document_count = extract_knowledge(data_dir / "knowledge-base.zip", working / "corpus")
+        document_count = extract_knowledge(knowledge_path, working / "corpus")
         corpus = ingest(working / "corpus")
         corpus.save(working / "index")
         core = build_core(working / "index", llm_config=config, platform=not offline)
         if not core.ready:
             raise SubmissionError("The supplied knowledge index is not ready")
+        print(
+            f"Submission inputs ready: questions={len(questions)}; documents={document_count}.",
+            file=sys.stderr, flush=True,
+        )
         retrieval_counts: dict[str, int] = {}
         async def execute():
             remaining = total_timeout - (time.monotonic() - started)
             await core.prepare_retrieval(timeout_budget_ms=max(1, int(min(120, remaining * 0.25) * 1000)))
+            print(
+                f"Submission retrieval ready: configured={core.retrieval_config.mode}; "
+                f"fallback={core._prepare_failure or 'none'}.",
+                file=sys.stderr, flush=True,
+            )
             return await answer_questions(
                 questions, core, workers=workers,
                 case_timeout_seconds=case_timeout,
@@ -294,6 +331,10 @@ def run_submission(data_dir: Path, output: Path, *, offline: bool = False) -> di
                 retrieval_counts=retrieval_counts,
             )
         answers, failures = asyncio.run(execute())
+        print(
+            f"Submission generation complete: answers={len(answers)}; fallbacks={failures}.",
+            file=sys.stderr, flush=True,
+        )
         if [identifier for identifier, _ in answers] != [question.id for question in questions]:
             raise SubmissionError("Output IDs do not match the input")
         write_submission(output, answers)
@@ -313,18 +354,20 @@ def run_submission(data_dir: Path, output: Path, *, offline: bool = False) -> di
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-dir", type=Path, default=Path(os.getenv("DATA_DIR", "data")))
+    parser.add_argument("--data-dir", type=Path, default=Path(env_value("DATA_DIR", default="data")))
     parser.add_argument("--output", type=Path, default=Path("submission.csv"))
     parser.add_argument("--offline", action="store_true", help="Explicit local-only extractive baseline")
     args = parser.parse_args(argv)
+    runtime = ".".join(str(part) for part in sys.version_info[:3])
+    print(f"Submission started: python={runtime}; validating configuration and inputs.", file=sys.stderr, flush=True)
     try:
         result = run_submission(args.data_dir, args.output, offline=args.offline)
     except SubmissionError as error:
-        print(f"Submission input error: {error}", file=sys.stderr)
+        print(f"Submission input error: {error}", file=sys.stderr, flush=True)
         return 2
     except (OSError, ValueError, BadZipFile, csv.Error):
         # Provider credentials, document text and question content never enter logs.
-        print("Submission failed: check input files, model environment and supported dependencies.", file=sys.stderr)
+        print("Submission failed: check input files, model environment and supported dependencies.", file=sys.stderr, flush=True)
         return 2
     print(
         f"Wrote submission.csv: {result['questions']} answers; "
@@ -332,7 +375,7 @@ def main(argv=None) -> int:
         f"fallbacks={result['fallbacks']}; retrieval={result['retrieval']}; "
         f"configured_retrieval={result['configured_retrieval']}; "
         f"startup_retrieval_fallback={result['retrieval_fallback']}; "
-        f"retrieval_counts={result['retrieval_counts']}.", file=sys.stderr,
+        f"retrieval_counts={result['retrieval_counts']}.", file=sys.stderr, flush=True,
     )
     return 0
 

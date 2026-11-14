@@ -10,7 +10,6 @@ import asyncio
 import hashlib
 import json
 import math
-import os
 import random
 import time
 from collections.abc import Mapping, Sequence
@@ -22,6 +21,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from .environment import env_value
 from .protocol import ConsultationUnavailable
 
 if TYPE_CHECKING:
@@ -126,11 +126,10 @@ class EmbeddingConfig:
 
     @classmethod
     def from_env(cls, *, platform: bool = False, llm_config: LLMConfig | None = None) -> "EmbeddingConfig":
-        def get(*names: str, default: str = "") -> str:
-            return next((os.environ[name] for name in names if os.environ.get(name)), default)
+        get = env_value
         expected = get("EMBEDDING_DIMENSIONS")
         return cls(
-            base_url=llm_config.base_url if llm_config is not None else get("LLM_BASE_URL", "OPENAI_BASE_URL"),
+            base_url=llm_config.base_url if llm_config is not None else get("LLM_BASE_URL", "BASE_URL", "OPENAI_BASE_URL"),
             api_key=get("EMBEDDER_API_KEY", default=llm_config.api_key) if llm_config is not None else get("EMBEDDER_API_KEY", "LLM_API_KEY", "OPENAI_API_KEY"),
             model=get("EMB_MODEL", default="baai/bge-m3"),
             allow_private_corpus=platform or (llm_config.allow_private_corpus if llm_config is not None else get("ALLOW_PRIVATE_CORPUS_TO_LLM", "LLM_ALLOW_PRIVATE_CORPUS").lower() in {"1", "true", "yes"}),
@@ -196,10 +195,13 @@ class OpenAIEmbeddingClient:
                         raise EmbeddingUnavailable("embedding_http_error", "Embedding API rejected the request")
                     else:
                         retryable = False
-                        if response.headers.get("content-encoding", "identity").lower() != "identity":
+                        encodings = {part.strip().lower() for part in response.headers.get("content-encoding", "identity").split(",")}
+                        if not encodings.issubset({"identity", "gzip", "deflate"}):
                             raise InvalidEmbedding("Embedding response uses unsupported compression")
                         content = bytearray()
-                        async for part in response.aiter_bytes():
+                        # Bound decoded bytes; compressed lengths are not a safe
+                        # measure of the JSON/vector payload held in memory.
+                        async for part in response.aiter_bytes(chunk_size=65536):
                             content.extend(part)
                             if len(content) > MAX_RESPONSE_BYTES:
                                 raise InvalidEmbedding("Embedding response exceeds the supported size")

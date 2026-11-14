@@ -65,7 +65,7 @@ LLM_API_KEY=<provided at runtime>
 LLM_MODEL=<provided at runtime>
 ```
 
-The organizer supplies proxy credentials automatically on its platform. Environment aliases `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL` and `GEN_MODEL` are supported by the shared client. The web API requires an explicit opt-in to transmit corpus excerpts. TLS is required except for localhost or explicitly enabled internal HTTP (`LLM_ALLOW_INTERNAL_HTTP=true`). Redirects are refused. A single wall-clock budget covers model transport, response reads and transient retries. See `.env.example` for other settings.
+The organizer supplies proxy credentials automatically on its platform. Environment aliases `BASE_URL`, `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL` and `GEN_MODEL` are supported by the shared client. Values are stripped, and an unset template value equal to its variable name is ignored, matching the organizer's sample. The web API requires an explicit opt-in to transmit corpus excerpts. TLS is required except for localhost or explicitly enabled internal HTTP (`LLM_ALLOW_INTERNAL_HTTP=true`). Redirects are refused. A single wall-clock budget covers model transport, response reads and transient retries. See `.env.example` for other settings.
 
 With generation enabled, retrieval defaults to BM25 plus dense cosine search, combined through reciprocal-rank fusion. `EMB_MODEL` selects the organizer embedding model (`baai/bge-m3` is the recovered sample default); it uses the same proxy and key, with optional `EMBEDDER_API_KEY`. The corpus is embedded once at startup. `TOP_K=6` passages reach the generator from 20 candidates per retrieval branch. Set `RETRIEVAL_MODE=bm25` for an ablation. Embedding failures produce a recorded lexical fallback. Optional vector caches belong in a writable private `EMBEDDING_CACHE_DIR`; by default vectors stay in memory. See [ML configuration and evaluation](app/ml/README.md).
 
@@ -119,6 +119,8 @@ A failed earlier turn cannot be retried after a newer user turn; the API returns
 
 Official input is `DATA_DIR/questions.csv` with `id,question` plus `DATA_DIR/knowledge-base.zip`; default `DATA_DIR` is `data`. Output is `./submission.csv`, exactly `id,answer`, one nonempty answer per unique input ID, at most 10,000 characters per answer. Published role-labelled dialogues are parsed with fresh context for every row.
 
+For compatibility with the official example, input lookup also checks script-relative `DATA_DIR` and the working directory, accepting `train.csv`, `knowledge_base.zip` and `kb.zip` aliases. Output is replaced atomically with mode `0644` so a separate grading process can read it. Private indexes and embedding caches retain their owner-only permissions. Sanitized progress markers report the runtime version, completed phases and counts without logging credentials, questions or source passages. One failed question retains a safe fallback and does not prevent other IDs from being written.
+
 ```bash
 # Requires the organizer proxy environment variables.
 python solution.py
@@ -132,7 +134,7 @@ python scripts/build_submission.py --output dist/submission.zip
 
 The packager rewrites shared module imports through Python's AST. It excludes web application code, corpus, index, questions, environment files and credentials. Dependencies in the platform ZIP are from the recovered allowed list. Input files are supplied by the platform, so no precomputed-index exception is needed. No submission was uploaded.
 
-`MAX_WORKERS` defaults to 3 and is capped at 8; `CONSULTATION_TIMEOUT_SECONDS` defaults to 60, and `SUBMISSION_TIMEOUT_SECONDS` to 1080, leaving room below the organizer's 20-minute limit. The model transport also honors `ML_TIMEOUT_SECONDS`, `TEMPERATURE`, `MAX_TOKENS` and official access aliases. Check live service limits before tuning.
+`MAX_WORKERS` defaults to 3 and is capped at 8; `CONSULTATION_TIMEOUT_SECONDS` defaults to 120, and `SUBMISSION_TIMEOUT_SECONDS` to 1080, leaving room below the organizer's 20-minute limit. The model transport defaults to 90 seconds on the platform and 10 seconds in the web service; explicit `ML_TIMEOUT_SECONDS` overrides either default. It also honors `TEMPERATURE`, `MAX_TOKENS` and official access aliases. Check live service limits before tuning.
 
 ## Verify
 

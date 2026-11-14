@@ -2,7 +2,34 @@
 
 Updated 14 November 2026. This record separates the current development checks from results recorded on 13 November. Historical results describe the code and environment tested at that time; they are not a claim that the latest code was rerun in every earlier environment.
 
-## 14 November: regression and packaging
+## 14 November: scoring-error investigation and corrected ZIP
+
+The first uploaded archive received the platform message “Ошибка скоринга сабмита. Попробуйте позже”. No run ID, logs or stage details were exposed. A fresh fetch found no changes to the official regulation, sample ZIP or allowed dependency list. The generic message is not documented, so it does not establish whether failure occurred during execution, CSV validation or judging.
+
+The exact original archive (`19616eebfec0f383fd897dd122f69705d270208108ac59ddb866e796c8ec5e92`) was preserved and compared with the official sample. Reproductions found real compatibility defects:
+
+- Literal template values such as `TEMPERATURE=TEMPERATURE`, `MAX_TOKENS=MAX_TOKENS`, `TOP_K=TOP_K` and `DATA_DIR=DATA_DIR` could abort before creating a CSV. Whitespace/placeholders could also mask valid aliases. These now use the sample's normalization rules; `BASE_URL` and model alias precedence match the sample.
+- Valid sample `TOP_K` values above 12 were rejected. The range is now 1..30 and the default candidate pool grows when necessary.
+- Inputs located in the working directory or using the sample's alternative filenames were not found. The lookup now follows the sample's locations and aliases.
+- A malformed HTTP 200 response containing `choices: [null]` raised `AttributeError` and terminated the run. Envelope types are now validated, and unexpected individual-question failures are isolated without logging raw exception messages.
+- Valid compressed responses were rejected, and the platform inherited the web service's 10-second generation timeout. Gzip/deflate now retain decoded-size checks; platform generation defaults to 90 seconds and the overall per-question budget to 120 seconds. The total submission budget remains 1080 seconds; web behavior stays at 10 seconds.
+- Atomic CSV output inherited mode `0600`. It now uses `0644`, matching ordinary output from the sample and allowing a separate grader user to read it. The scorer's actual UID is unknown, so this is a compatibility repair, not a confirmed cause. Private corpus/index/cache permissions are unchanged.
+
+Verification of the corrected archive:
+
+| Check | Result | Scope |
+| --- | --- | --- |
+| Full regression suite, local Python 3.12.14 | **247 passed, 7 skipped**, 7.89 s | Includes 31 submission tests; PostgreSQL integration tests require a configured database and were skipped. One existing Starlette/AnyIO warning. |
+| Clean Linux x86-64 / Python 3.12.15 image | Passed | Installed only the ZIP's three declared dependencies and their transitive requirements; no development packages or model weights. Runtime used a non-root UID, 2 CPUs, 1 GiB RAM, read-only root, writable temporary storage and no external network. |
+| Corrected ZIP: 16 synthetic proxy/config scenarios | **16/16 valid CSV outputs** | Placeholders, URL aliases, sample input locations/filenames, model placeholders, TOP_K=30, authentication failures, malformed/compressed responses and an 11-second successful generation. Realistic proxy failures produced safe responses rather than fabricated product claims. |
+| Original ZIP: the same startup probes | Nine startup scenarios failed without CSV | A separate malformed-response probe also reproduced exit 1 without CSV. The old 11-second generation timed out; the corrected version returned both expected synthetic answers. |
+| Corrected ZIP: official 19-document archive and 18 demo questions | **18/18 correct CSV rows**, exit 0 | Executed in the same isolated Linux container through a synthetic local proxy, including embedding requests. This validates input/pipeline/output execution, not live Qwen answer quality. |
+
+The corrected package has 14 root files; its extra module contains shared environment normalization. Sanitized phase markers now expose the Python version, input readiness, retrieval readiness, generation completion and final output counts. Private detailed audit logs remain outside the repository.
+
+These checks fix demonstrated defects. They cannot establish the cause of the reported platform failure without its execution/judge logs, nor certify a successful live score. If the corrected ZIP receives the same generic error, request the failed phase, process exit code, stdout/stderr, CSV validation outcome and whether the judge started, together with the team and submission time.
+
+## 14 November: earlier regression and packaging checkpoint
 
 | Check | Verified result | Scope and limit |
 | --- | --- | --- |

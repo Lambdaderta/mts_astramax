@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-import os
 import random
 import re
 import urllib.parse
@@ -14,6 +13,7 @@ from typing import Any
 import httpx
 
 from .grounding import CLARIFY_RESPONSES
+from .environment import env_value
 from .protocol import ConsultationRequest, ConsultationResult, ConsultationUnavailable, Evidence, InvalidEvidence
 from .retriever import SearchHit
 
@@ -53,15 +53,14 @@ class LLMConfig:
 
     @classmethod
     def from_env(cls, *, platform: bool = False) -> "LLMConfig":
-        def get(*names: str, default: str = "") -> str:
-            return next((os.environ[name] for name in names if os.environ.get(name)), default)
+        get = env_value
         return cls(
-            base_url=get("LLM_BASE_URL", "OPENAI_BASE_URL"),
+            base_url=get("LLM_BASE_URL", "BASE_URL", "OPENAI_BASE_URL"),
             api_key=get("LLM_API_KEY", "OPENAI_API_KEY"),
-            model=get("LLM_MODEL", "OPENAI_MODEL", "GEN_MODEL", default=DEFAULT_MODEL),
+            model=get("LLM_MODEL", "GEN_MODEL", "OPENAI_MODEL", default=DEFAULT_MODEL),
             allow_private_corpus=platform or get("ALLOW_PRIVATE_CORPUS_TO_LLM", "LLM_ALLOW_PRIVATE_CORPUS").lower() in {"1", "true", "yes"},
             allow_internal_http=platform or get("LLM_ALLOW_INTERNAL_HTTP").lower() in {"1", "true", "yes"},
-            timeout_seconds=float(get("ML_TIMEOUT_SECONDS", default="10")),
+            timeout_seconds=float(get("ML_TIMEOUT_SECONDS", default="90" if platform else "10")),
             temperature=float(get("TEMPERATURE", default="0")),
             max_tokens=int(get("MAX_TOKENS", default="2048")),
             max_retries=int(get("LLM_MAX_RETRIES", default="2")),
@@ -188,17 +187,29 @@ class EvidenceSelector:
 async def _read_model_response(response: httpx.Response) -> dict[str, Any]:
     data = bytearray()
     try:
-        if response.headers.get("content-encoding", "identity").lower() != "identity":
-            raise ValueError("Unexpected model response encoding")
-        async for chunk in response.aiter_bytes():
+        encodings = {part.strip().lower() for part in response.headers.get("content-encoding", "identity").split(",")}
+        if not encodings.issubset({"identity", "gzip", "deflate"}):
+            raise ValueError("Unsupported model response encoding")
+        # httpx decodes supported HTTP compression. Limit the decoded payload,
+        # not compressed Content-Length, before parsing any model material.
+        async for chunk in response.aiter_bytes(chunk_size=65536):
             if len(data) + len(chunk) > MAX_RESPONSE_BYTES:
                 raise ValueError("Oversized model response")
             data.extend(chunk)
         parsed = json.loads(data)
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("choices"), list) or not parsed["choices"]:
+            raise ValueError("Invalid chat completion envelope")
         choice = parsed["choices"][0]
-        if choice.get("finish_reason") in {"length", "content_filter", "tool_calls", "function_call"}:
+        if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
+            raise ValueError("Invalid completion choice or message")
+        finish_reason = choice.get("finish_reason")
+        if finish_reason is not None and not isinstance(finish_reason, str):
+            raise ValueError("Invalid completion finish reason")
+        if finish_reason in {"length", "content_filter", "tool_calls", "function_call"}:
             raise ValueError("Model did not complete a final answer")
-        content = choice["message"]["content"]
+        content = choice["message"].get("content")
+        if not isinstance(content, str):
+            raise ValueError("Expected final textual model content")
         if isinstance(content, str):
             # Some Qwen-compatible servers put a bounded reasoning prefix in
             # content instead of a separate reasoning_content field. Only the

@@ -97,12 +97,14 @@ select one source while preserving this same excerpt rendering.
 
 `LLMConfig.from_env(platform=True)` accepts the organizer proxy settings:
 
-- `LLM_BASE_URL` or `OPENAI_BASE_URL`.
+- `LLM_BASE_URL`, `BASE_URL`, or `OPENAI_BASE_URL`.
 - `LLM_API_KEY` or `OPENAI_API_KEY`.
-- `LLM_MODEL`, `OPENAI_MODEL`, or `GEN_MODEL`, defaulting to `qwen/qwen3.8-27b`.
+- `LLM_MODEL`, `GEN_MODEL`, or `OPENAI_MODEL`, defaulting to `qwen/qwen3.8-27b`.
 - `TEMPERATURE`, `MAX_TOKENS`, `ML_TIMEOUT_SECONDS` and `LLM_MAX_RETRIES`.
 
-The first nonempty alias wins. The platform mode permits the supplied internal
+The first nonempty, non-placeholder alias wins after stripping whitespace. A
+value equal to its own variable name is ignored, as in the organizer sample.
+The platform mode permits the supplied internal
 proxy. Web mode enables provider calls through `LLM_ENABLED=true` with
 `ALLOW_PRIVATE_CORPUS_TO_LLM=true`. Non-local HTTP needs an explicit
 `LLM_ALLOW_INTERNAL_HTTP=true`. The async HTTP client refuses redirects and
@@ -110,6 +112,10 @@ honors a single time budget across response streaming and transient retries.
 Only transport errors, HTTP 429 and HTTP 5xx are retried. Typed unavailability
 allows the web API to record a retryable turn failure and the platform adapter
 to return a safe fallback. Provider errors do not expose credentials or bodies.
+Valid gzip/deflate responses are decoded by httpx and checked against the same
+decoded-byte limits. Malformed completion envelopes become controlled invalid
+evidence responses. Platform generation defaults to 90 seconds, versus 10
+seconds for the web service, and remains bounded by the remaining request budget.
 
 | Setting | Starting value | Meaning |
 | --- | --- | --- |
@@ -117,8 +123,8 @@ to return a safe fallback. Provider errors do not expose credentials or bodies.
 | `MAX_TOKENS` | `2048` | Generation budget; the current answer contract is still 150 words |
 | `MAX_WORKERS` | `3` | Parallel questions in the platform adapter |
 | `RETRIEVAL_MODE` | `hybrid` with generation, otherwise `bm25` | Retrieval ablation switch |
-| `TOP_K` | `6` | Maximum passages sent to grounded generation |
-| `RETRIEVAL_CANDIDATES` | `20` | Candidates from each branch |
+| `TOP_K` | `6` | Maximum passages sent to grounded generation; supported range 1..30 |
+| `RETRIEVAL_CANDIDATES` | `max(20, TOP_K)` | Candidates from each branch |
 | `RRF_K`, `LEXICAL_WEIGHT`, `DENSE_WEIGHT` | `60`, `1`, `1` | Rank fusion parameters |
 | `EMB_MODEL` | `baai/bge-m3` | Use the runtime model ID; default matches the organizer sample |
 | `EMBEDDING_BATCH_SIZE` | `32` | Documents per embedding request |

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-import os
+from .environment import env_value
 
 
 @dataclass(frozen=True)
@@ -20,8 +20,8 @@ class RetrievalConfig:
     def __post_init__(self):
         if self.mode not in {"bm25", "hybrid"}:
             raise ValueError("RETRIEVAL_MODE must be bm25 or hybrid")
-        if not 1 <= self.top_k <= 12 or not self.top_k <= self.candidate_pool <= 200:
-            raise ValueError("TOP_K must be 1..12 and RETRIEVAL_CANDIDATES must be TOP_K..200")
+        if not 1 <= self.top_k <= 30 or not self.top_k <= self.candidate_pool <= 200:
+            raise ValueError("TOP_K must be 1..30 and RETRIEVAL_CANDIDATES must be TOP_K..200")
         values = (self.rrf_k, self.lexical_weight, self.dense_weight, self.timeout_seconds)
         if not all(math.isfinite(value) and value > 0 for value in values):
             raise ValueError("Retrieval weights, RRF constant and timeout must be finite and positive")
@@ -30,15 +30,14 @@ class RetrievalConfig:
 
     @classmethod
     def from_env(cls, *, enabled: bool) -> "RetrievalConfig":
-        def get(name: str, default: str) -> str:
-            return os.getenv(name, "").strip() or default
+        top_k = int(env_value("TOP_K", default="6"))
         return cls(
-            mode=get("RETRIEVAL_MODE", "hybrid") if enabled else "bm25",
-            top_k=int(get("TOP_K", "6")),
-            candidate_pool=int(get("RETRIEVAL_CANDIDATES", "20")),
-            rrf_k=float(get("RRF_K", "60")),
-            lexical_weight=float(get("LEXICAL_WEIGHT", "1")),
-            dense_weight=float(get("DENSE_WEIGHT", "1")),
-            timeout_seconds=float(get("RETRIEVAL_TIMEOUT_SECONDS", "8")),
-            cache_dir=get("EMBEDDING_CACHE_DIR", "") or None,
+            mode=env_value("RETRIEVAL_MODE", default="hybrid") if enabled else "bm25",
+            top_k=top_k,
+            candidate_pool=int(env_value("RETRIEVAL_CANDIDATES", default=str(max(20, top_k)))),
+            rrf_k=float(env_value("RRF_K", default="60")),
+            lexical_weight=float(env_value("LEXICAL_WEIGHT", default="1")),
+            dense_weight=float(env_value("DENSE_WEIGHT", default="1")),
+            timeout_seconds=float(env_value("RETRIEVAL_TIMEOUT_SECONDS", default="8")),
+            cache_dir=env_value("EMBEDDING_CACHE_DIR") or None,
         )
