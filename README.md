@@ -37,7 +37,23 @@ Docker:
 docker compose up --build
 ```
 
-The API binds to localhost port 8000. SQLite lives in the `energytool_data` volume. The private index is mounted read-only from `./private/index` or `INDEX_DIR_HOST`. Without an index, session and contact workflows remain available, `/health/ready` returns 503, and product questions receive an explicit knowledge-unavailable response. `/health/live` checks the running process. See [validation results](docs/validation.md) for the container checks.
+The API binds to localhost port 8000 (`API_PORT` overrides it). Compose starts PostgreSQL 17 on its internal network and stores its data in `postgres_data`. The default password is for local use. Set `POSTGRES_PASSWORD` for a shared instance, or provide `DATABASE_URL` for a managed PostgreSQL database. The direct Python command uses `DATABASE_URL` if set, or the local SQLite file from `DATABASE_PATH` otherwise.
+
+The private index is mounted read-only from `./private/index` or `INDEX_DIR_HOST`. Without an index, session and contact workflows remain available, `/health/ready` returns 503, and product questions receive an explicit knowledge-unavailable response. `/health/live` checks the running process. See [validation results](docs/validation.md) for the container checks.
+
+### Import existing SQLite history
+
+Use an empty PostgreSQL database. Stop the old API and make a consistent SQLite backup before switching. The import copies existing history, sessions, and leads while keeping the original file readable. Session tokens and existing request IDs still work after the import. The importer rejects a destination with application data.
+
+```bash
+docker compose build api
+docker compose run --rm --volume /absolute/path/to/backup:/legacy:ro \
+  --entrypoint python api scripts/migrate_sqlite_to_postgres.py \
+  --sqlite-path /legacy/energytool.db
+docker compose up -d
+```
+
+For a PostgreSQL server accessible from the host, run the same Python script with `DATABASE_URL` exported and pass the local backup path. Verify existing conversations before discarding the old SQLite volume.
 
 To ingest an authorized local corpus:
 
@@ -63,19 +79,21 @@ LLM_API_KEY=<provided at runtime>
 LLM_MODEL=<provided at runtime>
 ```
 
-The organizer supplies proxy credentials automatically on its platform. Environment aliases `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL` and `GEN_MODEL` are supported by the shared client. The web API requires an explicit opt-in to transmit corpus excerpts. TLS is required except for localhost or explicitly enabled internal HTTP (`LLM_ALLOW_INTERNAL_HTTP=true`). Redirects are refused. A single wall-clock budget covers model transport, response reads and transient retries. See `.env.example` for other settings.
+The organizer supplies proxy credentials automatically on its platform. Environment aliases `BASE_URL`, `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL` and `GEN_MODEL` are supported by the shared client. Values are stripped, and an unset template value equal to its variable name is ignored, matching the organizer's sample. The web API requires an explicit opt-in to transmit corpus excerpts. TLS is required except for localhost or explicitly enabled internal HTTP (`LLM_ALLOW_INTERNAL_HTTP=true`). Redirects are refused. A single wall-clock budget covers model transport, response reads and transient retries. See `.env.example` for other settings.
+
+With generation enabled, retrieval defaults to BM25 plus dense cosine search, combined through reciprocal-rank fusion. `EMB_MODEL` selects the organizer embedding model (`baai/bge-m3` is the recovered sample default); it uses the same proxy and key, with optional `EMBEDDER_API_KEY`. The corpus is embedded once at startup. `TOP_K=6` passages reach the generator from 20 candidates per retrieval branch. Set `RETRIEVAL_MODE=bm25` for an ablation. Embedding failures produce a recorded lexical fallback. Optional vector caches belong in a writable private `EMBEDDING_CACHE_DIR`; by default vectors stay in memory. See [ML configuration and evaluation](app/ml/README.md).
 
 Set a private `REVIEW_TOKEN` to enable `/api/v1/review/*`. An empty token disables access. Generate it locally with `python -c "import secrets; print(secrets.token_urlsafe(32))"` and keep it out of frontend builds. `CORS_ORIGINS` allows explicit origins only. `REQUESTS_PER_MINUTE` limits requests per client address within one process. `MAX_BODY_BYTES` bounds incoming HTTP request bodies.
 
 ## Implemented
 
 - FastAPI/Pydantic REST endpoints, Russian customer-facing messages, JSON errors and request IDs.
-- SQLite/WAL persistence with an additive v1-to-v2 migration, per-session bearer token hashes, isolated append-only histories and protected review access. Readiness verifies the database schema and index availability.
-- Durable turn acceptance, idempotent retries, asynchronous polling, one active turn per session enforced in SQLite, expiring leases and attempt fencing after a crashed worker. Failed model calls preserve the user message; failed response commits never report success.
+- PostgreSQL persistence with per-session write serialization, per-session bearer token hashes, isolated append-only histories and protected review access. SQLite remains available for local development and import. Readiness verifies the database schema and index availability.
+- Durable turn acceptance, idempotent retries, asynchronous polling, one active turn per session enforced in the database, expiring leases and attempt fencing after a crashed worker. Failed model calls preserve the user message; failed response commits never report success.
 - Contacts entered through a versioned form or explicit chat labels; phone normalization; full and partial enquiries; persisted preview snapshots; stale-preview rejection; explicit idempotent confirmation. Saving is local, not delivery to a CRM or manager.
 - Historical explicit contact values remain redacted after correction or clearing. Raw history stays available only to the session owner and authorized review access. This is deterministic redaction, not a general PII detector.
 - Structured logs cover API responses, turn completion, model failures, retries, lead confirmations, and session closure. They carry operational IDs and durations. A log collector can aggregate the events and timing fields into counters and latency distributions.
-- A transport-independent consultation core, deterministic section-aware ingestion, corpus checksums, BM25 retrieval that uses relevant prior turns, measured stage timings and source traces. Grounded responses require short source-matching claims and relevant qualifications. Complete supporting evidence is available to authorized reviewers.
+- A transport-independent consultation core, deterministic section-aware ingestion, corpus checksums, hybrid BM25/dense retrieval with relevant prior turns, measured stage timings and source traces. Grounded responses permit source-backed synthesis, with deterministic provenance checks and one bounded source-review/correction pass when needed. Complete supporting evidence is available to authorized reviewers; model review is not a formal guarantee of factual correctness.
 - Official `solution.py` CSV processing with independent contexts, safe runtime ZIP extraction, bounded concurrency, atomic output and a deterministic root-only submission packager. The API and platform use the same core.
 
 ## API integration
@@ -96,11 +114,26 @@ Frontend flow:
 5. Create `/lead-preview`, display it, then confirm via `/leads` with `preview_id`, a stable `idempotency_key`, and `confirm:true`. Any new turn or contact change invalidates the preview.
 6. A new dialogue is a new session. Closing preserves history. Successful retries remain readable after closing; new changes are rejected.
 
+### Processing indicator
+
+Add `?include_progress=true` to `POST /api/v1/sessions/{id}/turns` and to the polling URL `GET /api/v1/sessions/{id}/turns/{turn_id}`. When the API returns `202`, render the newest `progress.stage` and optional topic labels from `progress.keywords`. Continue polling after `poll_after_ms` until a completed or failed response. A fast turn can return the final result immediately.
+
+| `progress.stage` | Example text for the chat |
+| --- | --- |
+| `queued` | Запрос принят |
+| `analyzing` | Учитываю контекст диалога |
+| `preparing_answer` | Готовлю ответ |
+| `finalizing` | Сохраняю результат |
+
+For a question about gas rates, `progress` can be `{"stage":"preparing_answer","keywords":["Газ","Тарифы"]}`. Labels come from a fixed list of topics and can be empty. The indicator describes processing while the final response is being prepared. Show it as transient status in the chat and replace it with the final result.
+
 A failed earlier turn cannot be retried after a newer user turn; the API returns `RETRY_SUPERSEDED`. Confirming the same preview with a different idempotency key returns `PREVIEW_ALREADY_CONFIRMED`, preventing duplicate leads. These additional rules are documented implementation choices.
 
 ## Platform adapter
 
 Official input is `DATA_DIR/questions.csv` with `id,question` plus `DATA_DIR/knowledge-base.zip`; default `DATA_DIR` is `data`. Output is `./submission.csv`, exactly `id,answer`, one nonempty answer per unique input ID, at most 10,000 characters per answer. Published role-labelled dialogues are parsed with fresh context for every row.
+
+For compatibility with the official example, input lookup also checks script-relative `DATA_DIR` and the working directory, accepting `train.csv`, `knowledge_base.zip` and `kb.zip` aliases. Output is replaced atomically with mode `0644` so a separate grading process can read it. Private indexes and embedding caches retain their owner-only permissions. Sanitized progress markers report the runtime version, completed phases, substantive answer counts, outcome/reason histograms and processing failures without logging credentials, questions or source passages. Legitimate abstention is distinguished from invalid model output. One failed question retains a safe fallback and does not prevent other IDs from being written.
 
 ```bash
 # Requires the organizer proxy environment variables.
@@ -115,7 +148,7 @@ python scripts/build_submission.py --output dist/submission.zip
 
 The packager rewrites shared module imports through Python's AST. It excludes web application code, corpus, index, questions, environment files and credentials. Dependencies in the platform ZIP are from the recovered allowed list. Input files are supplied by the platform, so no precomputed-index exception is needed. No submission was uploaded.
 
-`MAX_WORKERS` defaults to 3 and is capped at 8; `CONSULTATION_TIMEOUT_SECONDS` defaults to 60, and `SUBMISSION_TIMEOUT_SECONDS` to 1080, leaving room below the organizer's 20-minute limit. The model transport also honors `ML_TIMEOUT_SECONDS`, `TEMPERATURE`, `MAX_TOKENS` and official access aliases. Check live service limits before tuning.
+`MAX_WORKERS` defaults to 3 and is capped at 8; `CONSULTATION_TIMEOUT_SECONDS` defaults to 120, and `SUBMISSION_TIMEOUT_SECONDS` to 1080, leaving room below the organizer's 20-minute limit. The model transport defaults to 90 seconds on the platform and 10 seconds in the web service; explicit `ML_TIMEOUT_SECONDS` overrides either default. It also honors `TEMPERATURE`, `MAX_TOKENS` and official access aliases. Check live service limits before tuning.
 
 ## Verify
 
@@ -125,14 +158,20 @@ python -m pytest -q
 python scripts/smoke.py --base-url http://127.0.0.1:8000
 ```
 
-The smoke script creates a synthetic enquiry on the running server. Tests use temporary databases and synthetic knowledge; local fake-proxy tests open a loopback socket. No real model credentials or product corpus are required for the test suite.
+Set `TEST_POSTGRES_URL` to a disposable PostgreSQL database to include the PostgreSQL and SQLite import tests. The test role needs permission to create and drop test schemas. Each test uses its own schema. For example, when the test database is reachable on a local port:
 
-See [validation results](docs/validation.md) for the exact executed checks and their limits, and [requirements](docs/requirements-and-status.md) for the source distinction. For retrieval evaluation, `scripts/evaluate.py` accepts labelled JSONL queries and reports Recall@k and retrieval latency. It does not grade generated answers.
+```bash
+TEST_POSTGRES_URL=postgresql://energytool@127.0.0.1:5432/energytool python -m pytest -q
+```
+
+The smoke script creates a synthetic enquiry on the running server. Tests use temporary databases and synthetic knowledge. Local fake-proxy tests open a loopback socket. The suite runs without model credentials and uses synthetic product content.
+
+See [validation results](docs/validation.md) for executed checks and their limits, and [requirements](docs/requirements-and-status.md) for the source distinction. `scripts/evaluate.py` compares BM25, dense and hybrid retrieval against versioned private relevance labels, reporting Recall/MRR/nDCG and required evidence-group coverage. It does not grade generated answers. Private labels, vectors and reports stay outside source control.
 
 ## Remaining work
 
 Live Qwen response quality and latency remain unverified. Claim validation is deliberately conservative and can reject valid paraphrases. Product applicability, conditions spread across documents and source precedence still need evaluation on the issued corpus.
 
-Dialogue reasoning uses bounded history and stores explicit meter counts by resource with their source message. A later correction supersedes the previous value for that resource. General semantic facts, structured product recommendations, dense embedding search and model-based reranking remain open. Manager summaries use the latest substantive customer messages, retained facts and the latest outstanding consultation question when available.
+Dialogue reasoning uses bounded history and stores explicit meter counts by resource with their source message. A later correction supersedes the previous value for that resource. General semantic facts, structured product recommendations and model-based reranking remain open. Manager summaries use the latest substantive customer messages, retained facts and the latest outstanding consultation question when available.
 
 The chat frontend, presentation, deployment, CRM integration and competition upload were outside this backend/ML pass. [Integration questions](docs/integration-questions.md) lists the remaining external inputs; the most useful next step is a run against the organizer proxy, followed by reviewing the 18 demo answers and the real frontend contract.

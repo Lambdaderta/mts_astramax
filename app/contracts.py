@@ -13,6 +13,14 @@ class Empty(Model):
     pass
 
 
+def clean_text(value: str) -> str:
+    """Reject text that PostgreSQL cannot store as UTF-8."""
+    if '\x00' in value:
+        raise ValueError('Text contains a null character')
+    value.encode('utf-8')
+    return value.strip()
+
+
 class TurnInput(Model):
     client_message_id: UUID
     text: str = Field(min_length=1, max_length=4000)
@@ -20,7 +28,7 @@ class TurnInput(Model):
     @field_validator('text', mode='before')
     @classmethod
     def trim(cls, value):
-        return value.strip() if isinstance(value, str) else value
+        return clean_text(value) if isinstance(value, str) else value
 
 
 class ContactFields(Model):
@@ -31,7 +39,7 @@ class ContactFields(Model):
     @field_validator('full_name', 'company', mode='before')
     @classmethod
     def clean(cls, value):
-        return (value.strip() or None) if isinstance(value, str) else value
+        return (clean_text(value) or None) if isinstance(value, str) else value
 
     @field_validator('phone')
     @classmethod
@@ -114,10 +122,16 @@ class TurnCompleted(Model):
     lead_draft: Draft | None = None
 
 
+class TurnProgress(Model):
+    stage: Literal['queued','analyzing','preparing_answer','finalizing']
+    keywords: list[Literal['Электроэнергия','Вода','Тепло','Газ','Счётчики','Тарифы']]
+
+
 class TurnProcessing(Model):
     turn_id: str
     status: Literal['processing']
     poll_after_ms: int = 700
+    progress: TurnProgress | None = None
 
 
 class ErrorDetail(Model):

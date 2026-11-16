@@ -13,13 +13,15 @@ from uuid import uuid4
 from .errors import APIError
 from .facts import active_topic, current_facts, meter_count, save_fact
 from .privacy import extract_contacts, lead_context, manager_requested, redact
+from .progress import progress_keywords
 from .ml.protocol import (ConsultationRequest, ConsultationResult, ConsultationUnavailable,
                           CorpusNotReady, InvalidEvidence)
 from .ml.grounding import SAFE_RESPONSES
+from .storage import StorageError
 from .telemetry import record
 
 
-SQLITE_MAX_INT = 2**63 - 1
+DATABASE_MAX_INT = 2**63 - 1
 CONTEXT_MESSAGES = 32
 TURN_STAGES = ('retrieval','rerank','generation','validation')
 
@@ -106,7 +108,7 @@ class Service:
         return {'id':mid,'seq':seq,'role':role,'text':text,'created_at':stamp}
 
     def close_session(self,sid,request_id=None):
-        with self.db.transaction() as c:
+        with self.db.transaction(session_id=sid) as c:
             self.idle(c,sid)
             changed=c.execute("UPDATE sessions SET status='closed',phase='closed',closed_at=?,revision=revision+1 WHERE id=? AND status='active'",(now(),sid)).rowcount
             result={'session':self.session(c,sid)}
@@ -115,7 +117,7 @@ class Service:
         return result
 
     def messages(self,sid,after_seq,limit):
-        if after_seq > SQLITE_MAX_INT:
+        if after_seq > DATABASE_MAX_INT:
             return {'items':[],'next_after_seq':None}
         with self.db.read() as c:
             rows=c.execute('SELECT * FROM messages WHERE session_id=? AND seq>? ORDER BY seq LIMIT ?', (sid,after_seq,limit+1)).fetchall()
@@ -127,7 +129,7 @@ class Service:
             return {'draft':draft_view(c.execute('SELECT * FROM lead_drafts WHERE session_id=?',(sid,)).fetchone())}
 
     def patch_draft(self,sid,patch):
-        with self.db.transaction() as c:
+        with self.db.transaction(session_id=sid) as c:
             self.active(c,sid)
             self.idle(c,sid)
             draft=c.execute('SELECT * FROM lead_drafts WHERE session_id=?',(sid,)).fetchone()
@@ -148,14 +150,14 @@ class Service:
             previous=c.execute(f'SELECT {field} FROM lead_drafts WHERE session_id=?',(sid,)).fetchone()[0]
             for contact in (previous,value):
                 if contact:
-                    c.execute('INSERT OR IGNORE INTO contact_history VALUES (?,?,?)',(sid,field,contact))
+                    c.execute('INSERT INTO contact_history VALUES (?,?,?) ON CONFLICT DO NOTHING',(sid,field,contact))
         assignments=','.join(k+'=?' for k in fields)
         c.execute(f'UPDATE lead_drafts SET {assignments},revision=revision+1,updated_at=? WHERE session_id=?',(*fields.values(),now(),sid))
 
     def accept_turn(self,sid,payload):
         text,client_id=payload.text,str(payload.client_message_id)
         fingerprint=hashlib.sha256(text.encode()).hexdigest()
-        with self.db.transaction() as c:
+        with self.db.transaction(session_id=sid) as c:
             self.recover(c,sid)
             old=c.execute('SELECT * FROM turns WHERE session_id=? AND client_message_id=?',(sid,client_id)).fetchone()
             if old:
@@ -168,7 +170,9 @@ class Service:
                 last=c.execute("SELECT id FROM messages WHERE session_id=? AND role='user' ORDER BY seq DESC LIMIT 1",(sid,)).fetchone()
                 if last['id']!=old['user_message_id']:
                     raise APIError(409,'RETRY_SUPERSEDED','После этой реплики начат новый запрос. Повторите вопрос новым сообщением.')
-                c.execute("UPDATE turns SET status='processing',attempt=attempt+1,lease_until=?,error_code=NULL,retryable=0 WHERE id=?",(time.time()+self.settings.turn_lease_seconds,old['id']))
+                c.execute("""UPDATE turns SET status='processing',attempt=attempt+1,lease_until=?,
+                    error_code=NULL,retryable=0,progress_stage='queued',progress_keywords='[]' WHERE id=?""",
+                    (time.time()+self.settings.turn_lease_seconds,old['id']))
                 tid=old['id']
             else:
                 self.active(c,sid)
@@ -207,24 +211,24 @@ class Service:
             return turn,self.track(self.run_turn(turn,request_id))
         return turn,None
 
-    async def post_turn(self,sid,payload,request_id):
+    async def post_turn(self,sid,payload,request_id,*,include_progress=False):
         # A client disconnect must not abandon a committed turn before scheduling it.
         turn,task=await asyncio.shield(self.track(self.start_turn(sid,payload,request_id)))
         if task is not None:
             await asyncio.wait({task},timeout=self.settings.sync_wait_seconds)
-        result=await asyncio.to_thread(self.get_turn,sid,turn['id'],request_id)
+        result=await asyncio.to_thread(self.get_turn,sid,turn['id'],request_id,include_progress=include_progress)
         if result['status']=='failed':
             error=result['error']
             raise APIError(503 if error['retryable'] else 500,error['code'],error['message'],error['retryable'])
         return result
 
-    def get_turn(self,sid,tid,request_id):
+    def get_turn(self,sid,tid,request_id,*,include_progress=False):
         with self.db.read() as c:
             row=c.execute('SELECT * FROM turns WHERE id=? AND session_id=?',(tid,sid)).fetchone()
         if not row:
             raise APIError(404,'TURN_NOT_FOUND','Запрос не найден.')
         if row['status']=='processing' and (row['lease_until'] is None or row['lease_until']<=time.time()):
-            with self.db.transaction() as c:
+            with self.db.transaction(session_id=sid) as c:
                 self.recover(c,sid)
                 row=c.execute('SELECT * FROM turns WHERE id=? AND session_id=?',(tid,sid)).fetchone()
             if row['status']=='failed' and row['error_code']=='INTERRUPTED':
@@ -233,7 +237,11 @@ class Service:
         if row['status']=='completed':
             return json.loads(row['response_json'])
         if row['status']=='processing':
-            return {'turn_id':tid,'status':'processing','poll_after_ms':700}
+            result={'turn_id':tid,'status':'processing','poll_after_ms':700}
+            if include_progress:
+                result['progress']={'stage':row['progress_stage'],
+                                    'keywords':json.loads(row['progress_keywords'])}
+            return result
         return {'turn_id':tid,'status':'failed','error':{
             'code':row['error_code'],'message':('Не удалось завершить ответ. Повторите запрос с тем же ключом.' if row['retryable'] else 'Ответ не прошел проверку. Уточните вопрос новым сообщением.'),
             'request_id':request_id,'retryable':bool(row['retryable']),'details':{}}}
@@ -277,18 +285,27 @@ class Service:
                            for row in sorted(older,key=lambda row:row['seq'])]
         return session,latest,older_context+messages,draft,known_values,topic,facts
 
+    def update_turn_progress(self, turn, stage, keywords):
+        with self.db.transaction(session_id=turn['session_id']) as c:
+            return bool(c.execute("""UPDATE turns SET progress_stage=?,progress_keywords=?
+                WHERE id=? AND attempt=? AND status='processing' AND lease_until>?""",
+                (stage,packed(keywords),turn['id'],turn['attempt'],time.time())).rowcount)
+
     async def run_turn(self,turn,request_id):
         started=time.perf_counter()
         sid,tid,attempt=turn['session_id'],turn['id'],turn['attempt']
         event={'session_id':sid,'turn_id':tid,'request_id':request_id,
                'corpus_version':self.core.corpus_version,'attempt':attempt}
         try:
+            if not await asyncio.to_thread(self.update_turn_progress,turn,'analyzing',[]):
+                return
             session,latest,messages,draft,known_values,topic,facts=await asyncio.to_thread(
                 self.turn_context,sid,turn['user_message_id'])
             latest_text=messages[-1]['text']
             contact_reply=(session['phase'] in {'collecting_contacts','reviewing_lead'} and
                            bool(extract_contacts(latest['text'])) and not lead_context(latest_text))
             contact_flow=manager_requested(latest['text']) or contact_reply
+            keywords=progress_keywords(latest_text,topic)
             if contact_flow:
                 missing=draft['missing_fields']
                 labels={'full_name':'ФИО','phone':'телефон','company':'название компании'}
@@ -301,6 +318,8 @@ class Service:
                     latest_user_text=latest_text,messages=messages,active_topic=topic,facts=facts,
                     current_phase=session['phase'],corpus_version=event['corpus_version'],
                     timeout_budget_ms=int(self.settings.ml_timeout_seconds*1000))
+                if not await asyncio.to_thread(self.update_turn_progress,turn,'preparing_answer',keywords):
+                    return
                 try:
                     result=await asyncio.wait_for(self.core.consult(request),timeout=self.settings.ml_timeout_seconds)
                     result=ConsultationResult.model_validate(result)
@@ -321,6 +340,8 @@ class Service:
                    'model_metadata':{key:redact(value,draft,known_values) for key,value in result.model_metadata.items()
                                      if key in {'model','mode','corpus_version'}},
                    'recommended_products':[redact(value,draft,known_values) for value in result.recommended_products]}
+            if not await asyncio.to_thread(self.update_turn_progress,turn,'finalizing',keywords):
+                return
             storage_started=time.perf_counter()
             completed=await asyncio.to_thread(self.complete_turn,turn,latest,result.answer_text,phase,
                                               draft if contact_flow else None,trace)
@@ -336,7 +357,7 @@ class Service:
             await asyncio.to_thread(self.fail_turn,tid,attempt,'KNOWLEDGE_NOT_READY',True,event,started)
         except (ConsultationUnavailable,TimeoutError):
             await asyncio.to_thread(self.fail_turn,tid,attempt,'MODEL_UNAVAILABLE',True,event,started)
-        except sqlite3.Error:
+        except (StorageError, sqlite3.Error):
             await asyncio.to_thread(self.fail_turn,tid,attempt,'STORAGE_UNAVAILABLE',True,event,started)
         except Exception:
             # Never disclose prompt contents, provider responses, DB paths, or PII.
@@ -344,7 +365,7 @@ class Service:
 
     def complete_turn(self,turn,latest,answer,phase,draft,trace):
         sid,tid,attempt=turn['session_id'],turn['id'],turn['attempt']
-        with self.db.transaction() as c:
+        with self.db.transaction(session_id=sid) as c:
             current=c.execute('SELECT status,attempt,lease_until FROM turns WHERE id=?',(tid,)).fetchone()
             # A worker that lost its lease cannot append an answer.
             if current['status']!='processing' or current['attempt']!=attempt or not current['lease_until'] or current['lease_until']<=time.time():
@@ -361,18 +382,18 @@ class Service:
 
     def fail_turn(self,tid,attempt,code,retryable,event,started):
         try:
-            with self.db.transaction() as c:
+            with self.db.transaction(session_id=event['session_id']) as c:
                 changed=c.execute("""UPDATE turns SET status='failed',error_code=?,retryable=?,lease_until=NULL
                     WHERE id=? AND attempt=? AND status='processing' AND lease_until>?""",
                     (code,int(retryable),tid,attempt,time.time())).rowcount
-        except sqlite3.Error:
+        except (StorageError, sqlite3.Error):
             # Lease recovery remains available after the storage failure clears.
             return
         if changed:
             record('turn_failed',**event,error_code=code,elapsed_ms=round((time.perf_counter()-started)*1000,3))
 
     def preview(self,sid):
-        with self.db.transaction() as c:
+        with self.db.transaction(session_id=sid) as c:
             self.active(c,sid)
             self.idle(c,sid)
             draft=draft_view(c.execute('SELECT * FROM lead_drafts WHERE session_id=?',(sid,)).fetchone())
@@ -417,7 +438,7 @@ class Service:
 
     def confirm(self,sid,payload):
         key,pid=str(payload.idempotency_key),str(payload.preview_id)
-        with self.db.transaction() as c:
+        with self.db.transaction(session_id=sid) as c:
             old=c.execute('SELECT * FROM leads WHERE session_id=? AND idempotency_key=?',(sid,key)).fetchone()
             if old:
                 if old['preview_id']!=pid:
@@ -446,7 +467,7 @@ class Service:
         return {'lead':lead,'message':'Заявка сохранена в демонстрационном прототипе.'},True
 
     def review_sessions(self,offset,limit):
-        if offset > SQLITE_MAX_INT:
+        if offset > DATABASE_MAX_INT:
             return {'items':[],'next_offset':None}
         with self.db.read() as c:
             rows=c.execute('SELECT * FROM sessions ORDER BY opened_at,id LIMIT ? OFFSET ?',(limit+1,offset)).fetchall()
@@ -461,7 +482,7 @@ class Service:
         return {'session':session,'messages':messages,'draft':draft,'leads':leads}
 
     def review_leads(self,offset,limit):
-        if offset > SQLITE_MAX_INT:
+        if offset > DATABASE_MAX_INT:
             return {'items':[],'next_offset':None}
         with self.db.read() as c:
             rows=c.execute('''SELECT 'confirmed' AS record_type, id AS record_id, session_id, created_at AS stamp FROM leads

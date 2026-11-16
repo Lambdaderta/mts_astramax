@@ -7,8 +7,8 @@ import pytest
 
 from app.ml.core import LocalConsultationCore, build_query
 from app.ml.corpus import ingest
-from app.ml.grounding import CLARIFY_RESPONSES, validate_generated_result
-from app.ml.llm_client import DEFAULT_MODEL, EvidenceSelector, LLMConfig
+from app.ml.grounding import CLARIFY_RESPONSES, is_verbatim_supported, validate_generated_result
+from app.ml.llm_client import DEFAULT_MODEL, EvidenceSelector, LLMConfig, _read_model_response
 from app.ml.protocol import (
     ConsultationRequest, ConsultationResult, ConsultationUnavailable, ContextMessage, Evidence, InvalidEvidence, UserFact,
 )
@@ -16,6 +16,32 @@ from app.ml.protocol import (
 
 def config(**kwargs):
     return LLMConfig("http://localhost/v1", "mock", "dummy", allow_private_corpus=True, **kwargs)
+
+
+@pytest.mark.parametrize("content", [
+    '{"chunk_ids":[]}',
+    '<think>Synthetic reasoning is not answer content.</think>\n{"chunk_ids":[]}',
+    '<think>Synthetic reasoning.</think>\n```json\n{"chunk_ids":[]}\n```',
+])
+def test_qwen_reasoning_envelope_only_exposes_final_json(content):
+    response = httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {
+        "content": content, "reasoning_content": "Separate synthetic reasoning is ignored.",
+    }}]})
+    assert asyncio.run(_read_model_response(response)) == {"chunk_ids": []}
+
+
+@pytest.mark.parametrize("content,reason", [
+    ('<think>Unfinished reasoning {"chunk_ids":[]}', "stop"),
+    ('{"chunk_ids":[]}', "length"),
+    ('<think>' + 'x' * 32769 + '</think>{"chunk_ids":[]}', "stop"),
+    ('<think><think>Nested</think></think>{"chunk_ids":[]}', "stop"),
+    ('<think>First</think><think>Second</think>{"chunk_ids":[]}', "stop"),
+    ('{"chunk_ids":[]}', "content_filter"),
+])
+def test_truncated_or_unclosed_reasoning_is_not_an_answer(content, reason):
+    response = httpx.Response(200, json={"choices": [{"finish_reason": reason, "message": {"content": content}}]})
+    with pytest.raises(InvalidEvidence):
+        asyncio.run(_read_model_response(response))
 
 
 def request(text, **kwargs):
@@ -99,31 +125,32 @@ def test_invalid_model_evidence_uses_safe_reply(tmp_path):
     core = make_core(tmp_path, "Учебный стенд собирает показания приборов.")
     mock_generated(core, kind="answer", answer_text="Цена составляет 987 рублей.", chunk_ids=["unknown"])
     result = asyncio.run(core.consult(request("Как стенд собирает показания?")))
-    assert result.reason_code == "invalid_generated_evidence"
+    assert result.reason_code == "invalid_model_evidence"
     assert result.evidence == [] and "987" not in result.answer_text
 
 
-def test_generated_answer_keeps_adjacent_qualification_and_rejects_reversed_roles(tmp_path):
+def test_fast_path_requires_adjacent_qualification_and_preserves_roles(tmp_path):
     source = "Сервер проверяет контроллер. Только после запуска.\n\nДатчики показывают текущие\nпоказания."
     core = make_core(tmp_path, source)
     chunk = core.corpus.chunks[0]
     evidence = [Evidence(document_id=chunk.document_id, chunk_id=chunk.chunk_id, quote=chunk.text)]
-    for answer in ("Контроллер проверяет сервер. Только после запуска.", "Сервер проверяет контроллер.", source):
-        with pytest.raises(InvalidEvidence):
-            validate_generated_result(ConsultationResult(kind="answer", answer_text=answer, reason_code="test", evidence=evidence), core.corpus)
-    for answer in ("Сервер проверяет контроллер. Только после запуска.", "Датчики показывают текущие показания."):
-        validate_generated_result(ConsultationResult(kind="answer", answer_text=answer, reason_code="test", evidence=evidence), core.corpus)
+    for answer in ("Контроллер проверяет сервер. Только после запуска.", "Сервер проверяет контроллер."):
+        assert not is_verbatim_supported(ConsultationResult(kind="answer", answer_text=answer, reason_code="test", evidence=evidence), core.corpus)
+    for answer in ("Сервер проверяет контроллер. Только после запуска.", "Датчики показывают текущие показания.", source):
+        result = ConsultationResult(kind="answer", answer_text=answer, reason_code="test", evidence=evidence)
+        validate_generated_result(result, core.corpus)
+        assert is_verbatim_supported(result, core.corpus)
 
 
-def test_generated_answer_length_is_capped_even_for_a_real_chunk(tmp_path):
+def test_recommended_word_length_routes_to_review_instead_of_rejecting(tmp_path):
     source = "Сведения " * 151 + "."
     core = make_core(tmp_path, source)
     chunk = core.corpus.chunks[0]
     result = ConsultationResult(kind="answer", answer_text=source, reason_code="test", evidence=[
         Evidence(document_id=chunk.document_id, chunk_id=chunk.chunk_id, quote=chunk.text),
     ])
-    with pytest.raises(InvalidEvidence, match="length"):
-        validate_generated_result(result, core.corpus)
+    validate_generated_result(result, core.corpus)
+    assert not is_verbatim_supported(result, core.corpus)
 
 
 def test_default_provider_model(monkeypatch):

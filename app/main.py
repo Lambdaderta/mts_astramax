@@ -15,7 +15,7 @@ from . import contracts as c
 from .errors import APIError
 from .middleware import RequestGuard
 from .settings import Settings
-from .storage import Database
+from .storage import Database, StorageError
 from .services import Service
 from .ml.protocol import ConsultationCore
 
@@ -30,7 +30,9 @@ def create_app(settings: Settings | None = None, core: ConsultationCore | None =
             from .ml.adapter import build_core, LLMConfig
             llm_config = LLMConfig.from_env(platform=False) if settings.llm_enabled else None
             selected_core = build_core(settings.index_dir, llm_config=llm_config)
-        app.state.service = Service(Database(settings.database_path), selected_core, settings)
+            await selected_core.prepare_retrieval()
+        database = Database(settings.database_url or settings.database_path)
+        app.state.service = Service(database, selected_core, settings)
         try:
             yield
         finally:
@@ -85,6 +87,7 @@ def create_app(settings: Settings | None = None, core: ConsultationCore | None =
         return await api_error(request,error)
 
     @app.exception_handler(sqlite3.Error)
+    @app.exception_handler(StorageError)
     async def storage_error(request, exc):
         return await api_error(request,APIError(503,'STORAGE_UNAVAILABLE','Не удалось сохранить данные. Повторите запрос.',True))
 
@@ -100,7 +103,7 @@ def create_app(settings: Settings | None = None, core: ConsultationCore | None =
     def ready(response: Response):
         try:
             database=svc().db.ready()
-        except sqlite3.Error:
+        except (StorageError, sqlite3.Error):
             database=False
         knowledge=bool(svc().core.ready)
         available=database and knowledge
@@ -126,17 +129,19 @@ def create_app(settings: Settings | None = None, core: ConsultationCore | None =
         return svc().messages(session_id,after_seq,limit)
 
     @app.post('/api/v1/sessions/{session_id}/turns',response_model=c.TurnCompleted|c.TurnProcessing,
-              responses={202:{'model':c.TurnProcessing}},tags=['turns'])
-    async def post_turn(session_id: SessionID,body: c.TurnInput,request: Request,response: Response):
-        result=await svc().post_turn(session_id,body,request.state.request_id)
+              responses={202:{'model':c.TurnProcessing}},response_model_exclude_unset=True,tags=['turns'])
+    async def post_turn(session_id: SessionID,body: c.TurnInput,request: Request,response: Response,
+                        include_progress: bool=Query(False,description='Include current processing stage and topic labels in HTTP 202.')):
+        result=await svc().post_turn(session_id,body,request.state.request_id,include_progress=include_progress)
         if result['status']=='processing':
             response.status_code=202
         return result
 
     @app.get('/api/v1/sessions/{session_id}/turns/{turn_id}',response_model=c.TurnCompleted|c.TurnProcessing|c.TurnFailed,
-             responses={202:{'model':c.TurnProcessing}},tags=['turns'])
-    def get_turn(session_id: SessionID,turn_id: UUID,request: Request,response: Response):
-        result=svc().get_turn(session_id,str(turn_id),request.state.request_id)
+             responses={202:{'model':c.TurnProcessing}},response_model_exclude_unset=True,tags=['turns'])
+    def get_turn(session_id: SessionID,turn_id: UUID,request: Request,response: Response,
+                 include_progress: bool=Query(False,description='Include current processing stage and topic labels in HTTP 202.')):
+        result=svc().get_turn(session_id,str(turn_id),request.state.request_id,include_progress=include_progress)
         if result['status']=='processing':
             response.status_code=202
         return result

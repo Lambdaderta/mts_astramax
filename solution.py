@@ -22,6 +22,7 @@ from zipfile import BadZipFile, ZipFile
 
 from app.ml.adapter import LLMConfig, build_core
 from app.ml.corpus import SUPPORTED_SUFFIXES, ingest
+from app.ml.environment import env_value
 from app.ml.protocol import (
     ConsultationRequest, ConsultationUnavailable, ContextMessage, InvalidEvidence,
 )
@@ -50,6 +51,16 @@ DIALOGUE_LABEL = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 USER_LABELS = {"пользователь", "клиент", "user", "human"}
+GENERATED_OUTPUT_FAILURES = {
+    "invalid_model_output", "model_output_truncated", "invalid_model_evidence",
+    "invalid_generated_evidence", "answer_review_unavailable", "answer_review_invalid", "invalid_evidence",
+}
+DIAGNOSTIC_REASONS = GENERATED_OUTPUT_FAILURES | {
+    "grounded_answer", "grounded_excerpt", "missing_evidence", "missing_material_context",
+    "outside_scope", "untrusted_instruction", "conflicting_evidence", "corpus_unavailable",
+    "manager_requested", "invalid_question", "model_unavailable", "case_timeout", "total_timeout",
+    "invalid_output", "unexpected_error",
+}
 
 
 class SubmissionError(ValueError):
@@ -60,6 +71,21 @@ class SubmissionError(ValueError):
 class Question:
     id: str
     text: str
+
+
+def find_input_file(data_dir: Path, *names: str) -> Path:
+    """Match the organizer's DATA_DIR, script-relative and cwd lookup order.
+
+    Within each location the documented filename precedes compatibility names.
+    """
+    for root in (data_dir, Path(__file__).resolve().parent / data_dir, Path.cwd()):
+        for name in names:
+            path = root / name
+            if path.is_file():
+                return path
+    raise SubmissionError(
+        f"Could not find {' or '.join(names)} in DATA_DIR, script-relative DATA_DIR or the working directory"
+    )
 
 
 def read_questions(path: Path) -> list[Question]:
@@ -186,42 +212,81 @@ def consultation_request(question: Question, corpus_version: str, timeout_ms: in
 
 async def answer_questions(
     questions: list[Question], core, *, workers: int = 3,
-    case_timeout_seconds: float = 60, total_timeout_seconds: float = 1080,
+    case_timeout_seconds: float = 120, total_timeout_seconds: float = 1080,
+    retrieval_counts: dict[str, int] | None = None,
+    stats: dict[str, dict[str, int]] | None = None,
 ) -> tuple[list[tuple[str, str]], int]:
+    """Return output rows and the number caused by execution/output failures.
+
+    Legitimate clarification, abstention, scope and handoff decisions are not
+    failures. Rejected model output and cases left by the deadline are failures.
+    Optional stats receives text-free outcome, reason and failure histograms.
+    """
     deadline = time.monotonic() + total_timeout_seconds
     answers = [(question.id, FAILURE_ANSWER) for question in questions]
-    failures = len(questions)
+    outcomes = [("not_processed", "total_timeout", True) for _ in questions]
     pending = iter(enumerate(questions))
 
     async def worker() -> None:
-        nonlocal failures
         for index, question in pending:
             remaining = min(case_timeout_seconds, deadline - time.monotonic())
             if remaining <= 0:
                 return
             try:
-                request = consultation_request(question, core.corpus_version, max(1, int(remaining * 1000)))
-            except ValueError:
-                # Do not guess a user question from a malformed role transcript.
-                answers[index] = question.id, INVALID_QUESTION_ANSWER
-                continue
-            if manager_requested(request.latest_user_text):
-                answers[index] = question.id, CONTACT_REQUEST_ANSWER
-                failures -= 1
-                continue
-            try:
+                try:
+                    request = consultation_request(question, core.corpus_version, max(1, int(remaining * 1000)))
+                except ValueError:
+                    # Do not guess a user question from a malformed role transcript.
+                    answers[index] = question.id, INVALID_QUESTION_ANSWER
+                    outcomes[index] = "clarify", "invalid_question", True
+                    continue
+                if manager_requested(request.latest_user_text):
+                    answers[index] = question.id, CONTACT_REQUEST_ANSWER
+                    outcomes[index] = "handoff", "manager_requested", False
+                    continue
                 async with asyncio.timeout(min(remaining, deadline - time.monotonic())):
                     result = await core.consult(request)
+                if retrieval_counts is not None:
+                    retrieval_mode = result.model_metadata.get("retrieval_mode", "unknown")
+                    retrieval_counts[retrieval_mode] = retrieval_counts.get(retrieval_mode, 0) + 1
                 core.validate_result(result)
                 text = result.answer_text.strip()
                 if not text or len(text) > MAX_ANSWER_CHARACTERS:
                     raise InvalidEvidence("Invalid output length")
-            except (ConsultationUnavailable, InvalidEvidence, ValueError, TimeoutError):
+            except ConsultationUnavailable:
+                outcomes[index] = "error", "model_unavailable", True
+                continue
+            except InvalidEvidence:
+                outcomes[index] = "error", "invalid_generated_evidence", True
+                continue
+            except ValueError:
+                outcomes[index] = "error", "invalid_output", True
+                continue
+            except TimeoutError:
+                outcomes[index] = "error", "case_timeout", True
+                continue
+            except Exception as error:
+                # Isolate unexpected provider/core errors to their case. Error
+                # messages may contain credentials or source text, so omit them.
+                print(
+                    f"Submission case failed: phase=case_failed; case_index={index + 1}; "
+                    f"exception_type={type(error).__name__}.", file=sys.stderr, flush=True,
+                )
+                outcomes[index] = "error", "unexpected_error", True
                 continue
             answers[index] = question.id, text
-            failures -= 1
+            reason = result.reason_code if result.reason_code in DIAGNOSTIC_REASONS else "other"
+            outcomes[index] = result.kind, reason, reason in GENERATED_OUTPUT_FAILURES or reason == "corpus_unavailable"
 
     await asyncio.gather(*(worker() for _ in range(min(workers, len(questions)))))
+    failures = sum(failed for _, _, failed in outcomes)
+    if stats is not None:
+        stats.update({"outcomes": {}, "reasons": {}, "failures": {}})
+        for outcome, reason, failed in outcomes:
+            stats["outcomes"][outcome] = stats["outcomes"].get(outcome, 0) + 1
+            stats["reasons"][reason] = stats["reasons"].get(reason, 0) + 1
+            if failed:
+                stats["failures"][reason] = stats["failures"].get(reason, 0) + 1
     return answers, failures
 
 
@@ -243,6 +308,9 @@ def write_submission(path: Path, answers: list[tuple[str, str]]) -> None:
             writer.writerow(["id", "answer"])
             writer.writerows(answers)
             stream.flush()
+            # The platform may read this result from a separate grading user.
+            # Private corpus/index/cache files retain their existing permissions.
+            os.fchmod(stream.fileno(), 0o644)
             os.fsync(stream.fileno())
         os.replace(temporary, path)
     finally:
@@ -251,8 +319,8 @@ def write_submission(path: Path, answers: list[tuple[str, str]]) -> None:
 
 
 def environment_number(name: str, default: float, lower: float, upper: float, *, integer=False):
-    value = os.getenv(name, "").strip()
-    if not value or value == name:
+    value = env_value(name)
+    if not value:
         return int(default) if integer else default
     try:
         parsed = int(value) if integer else float(value)
@@ -267,51 +335,97 @@ def run_submission(data_dir: Path, output: Path, *, offline: bool = False) -> di
     started = time.monotonic()
     # Missing credentials are a configuration failure, never an implicit offline run.
     config = None if offline else LLMConfig.from_env(platform=True)
-    questions = read_questions(data_dir / "questions.csv")
+    questions = read_questions(find_input_file(data_dir, "questions.csv", "train.csv"))
+    knowledge_path = find_input_file(data_dir, "knowledge-base.zip", "knowledge_base.zip", "kb.zip")
     workers = environment_number("MAX_WORKERS", 3, 1, 8, integer=True)
-    case_timeout = environment_number("CONSULTATION_TIMEOUT_SECONDS", 60, 1, 120)
+    case_timeout = environment_number("CONSULTATION_TIMEOUT_SECONDS", 120, 1, 120)
     total_timeout = environment_number("SUBMISSION_TIMEOUT_SECONDS", 1080, 1, 1140)
     with tempfile.TemporaryDirectory(prefix="energytool-submit-") as temporary:
         working = Path(temporary)
-        document_count = extract_knowledge(data_dir / "knowledge-base.zip", working / "corpus")
+        document_count = extract_knowledge(knowledge_path, working / "corpus")
         corpus = ingest(working / "corpus")
         corpus.save(working / "index")
-        core = build_core(working / "index", llm_config=config)
+        core = build_core(working / "index", llm_config=config, platform=not offline)
         if not core.ready:
             raise SubmissionError("The supplied knowledge index is not ready")
-        answers, failures = asyncio.run(answer_questions(
-            questions, core, workers=workers,
-            case_timeout_seconds=case_timeout,
-            total_timeout_seconds=total_timeout - (time.monotonic() - started),
-        ))
+        print(
+            f"Submission inputs ready: questions={len(questions)}; documents={document_count}.",
+            file=sys.stderr, flush=True,
+        )
+        retrieval_counts: dict[str, int] = {}
+        stats: dict[str, dict[str, int]] = {}
+        async def execute():
+            remaining = total_timeout - (time.monotonic() - started)
+            await core.prepare_retrieval(timeout_budget_ms=max(1, int(min(120, remaining * 0.25) * 1000)))
+            print(
+                f"Submission retrieval ready: configured={core.retrieval_config.mode}; "
+                f"fallback={core._prepare_failure or 'none'}.",
+                file=sys.stderr, flush=True,
+            )
+            return await answer_questions(
+                questions, core, workers=workers,
+                case_timeout_seconds=case_timeout,
+                total_timeout_seconds=total_timeout - (time.monotonic() - started),
+                retrieval_counts=retrieval_counts,
+                stats=stats,
+            )
+        answers, failures = asyncio.run(execute())
+        def format_counts(counts: dict[str, int]) -> str:
+            return ",".join(f"{name}:{count}" for name, count in sorted(counts.items())) or "none"
+        outcome_counts = format_counts(stats.get("outcomes", {}))
+        reason_counts = format_counts(stats.get("reasons", {}))
+        failure_counts = format_counts(stats.get("failures", {}))
+        substantive_answers = stats.get("outcomes", {}).get("answer", 0)
+        print(
+            f"Submission generation complete: rows={len(answers)}; substantive_answers={substantive_answers}; "
+            f"fallbacks={failures}; outcomes={outcome_counts}; reasons={reason_counts}; failures={failure_counts}.",
+            file=sys.stderr, flush=True,
+        )
         if [identifier for identifier, _ in answers] != [question.id for question in questions]:
             raise SubmissionError("Output IDs do not match the input")
         write_submission(output, answers)
+    completed_modes = {mode for mode, count in retrieval_counts.items() if count and mode != "not_run"}
+    actual_retrieval = next(iter(completed_modes)) if len(completed_modes) == 1 else "mixed" if completed_modes else "not_run"
+    if core._prepare_failure and not completed_modes:
+        actual_retrieval = "lexical_fallback"
     return {
         "questions": len(questions), "documents": document_count,
         "fallbacks": failures, "mode": "offline" if offline else "platform-model",
+        "substantive_answers": substantive_answers,
+        "outcome_counts": outcome_counts, "reason_counts": reason_counts, "failure_counts": failure_counts,
+        "retrieval": actual_retrieval,
+        "configured_retrieval": core.retrieval_config.mode,
+        "retrieval_fallback": core._prepare_failure or "none",
+        "retrieval_counts": ",".join(f"{mode}:{count}" for mode, count in sorted(retrieval_counts.items())) or "none",
     }
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-dir", type=Path, default=Path(os.getenv("DATA_DIR", "data")))
+    parser.add_argument("--data-dir", type=Path, default=Path(env_value("DATA_DIR", default="data")))
     parser.add_argument("--output", type=Path, default=Path("submission.csv"))
     parser.add_argument("--offline", action="store_true", help="Explicit local-only extractive baseline")
     args = parser.parse_args(argv)
+    runtime = ".".join(str(part) for part in sys.version_info[:3])
+    print(f"Submission started: python={runtime}; validating configuration and inputs.", file=sys.stderr, flush=True)
     try:
         result = run_submission(args.data_dir, args.output, offline=args.offline)
     except SubmissionError as error:
-        print(f"Submission input error: {error}", file=sys.stderr)
+        print(f"Submission input error: {error}", file=sys.stderr, flush=True)
         return 2
     except (OSError, ValueError, BadZipFile, csv.Error):
         # Provider credentials, document text and question content never enter logs.
-        print("Submission failed: check input files, model environment and supported dependencies.", file=sys.stderr)
+        print("Submission failed: check input files, model environment and supported dependencies.", file=sys.stderr, flush=True)
         return 2
     print(
-        f"Wrote submission.csv: {result['questions']} answers; "
+        f"Wrote submission.csv: {result['questions']} rows; "
         f"{result['documents']} documents; mode={result['mode']}; "
-        f"fallbacks={result['fallbacks']}.", file=sys.stderr,
+        f"substantive_answers={result['substantive_answers']}; fallbacks={result['fallbacks']}; "
+        f"outcomes={result['outcome_counts']}; reasons={result['reason_counts']}; failures={result['failure_counts']}; "
+        f"retrieval={result['retrieval']}; "
+        f"configured_retrieval={result['configured_retrieval']}; "
+        f"startup_retrieval_fallback={result['retrieval_fallback']}; "
+        f"retrieval_counts={result['retrieval_counts']}.", file=sys.stderr, flush=True,
     )
     return 0
 

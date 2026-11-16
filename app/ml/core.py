@@ -9,10 +9,16 @@ from pathlib import Path
 from .corpus import Corpus
 from .grounding import (
     CLARIFY_RESPONSES, MAX_ANSWER_WORDS, MAX_EXCERPT_CHARACTERS, SAFE_RESPONSES,
-    UNTRUSTED_INSTRUCTIONS, render_excerpts, validate_generated_result, validate_result,
+    UNTRUSTED_INSTRUCTIONS, is_verbatim_supported, render_excerpts, validate_generated_result, validate_result,
 )
 from .llm_client import EvidenceSelector, LLMConfig
-from .protocol import ConsultationRequest, ConsultationResult, CorpusNotReady, Evidence, InvalidEvidence
+from .embeddings import EmbeddingConfig, EmbeddingProvider, EmbeddingUnavailable, OpenAIEmbeddingClient
+from .hybrid import HybridRetriever
+from .retrieval_config import RetrievalConfig
+from .protocol import (
+    ConsultationRequest, ConsultationResult, ConsultationUnavailable, CorpusNotReady,
+    Evidence, InvalidEvidence, InvalidModelOutput,
+)
 from .retriever import BM25Retriever, SearchHit, tokens
 
 CONTACT_PATTERN = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|\+\d[\d ()-]{5,}\d|(?<!\d)[78](?:[ ()-]*\d){10}(?!\d)")
@@ -124,7 +130,9 @@ def _conflicting_prices(hits: list[SearchHit], query: str, context: str) -> bool
 
 
 class LocalConsultationCore:
-    def __init__(self, index_dir: str | Path, *, llm_config: LLMConfig | None = None):
+    def __init__(self, index_dir: str | Path, *, llm_config: LLMConfig | None = None,
+                 retrieval_config: RetrievalConfig | None = None,
+                 embedding_provider: EmbeddingProvider | None = None):
         try:
             self.corpus: Corpus | None = Corpus.load(index_dir)
         except CorpusNotReady:
@@ -132,8 +140,25 @@ class LocalConsultationCore:
         self.ready = self.corpus is not None
         self.corpus_version = self.corpus.version if self.corpus else "unavailable"
         self.retriever = BM25Retriever(self.corpus) if self.corpus else None
+        self.retrieval_config = retrieval_config or RetrievalConfig()
+        self.hybrid = HybridRetriever(
+            self.corpus, embedding_provider, cache_dir=self.retrieval_config.cache_dir,
+            candidate_pool=self.retrieval_config.candidate_pool, rrf_k=self.retrieval_config.rrf_k,
+            lexical_weight=self.retrieval_config.lexical_weight, dense_weight=self.retrieval_config.dense_weight,
+        ) if self.corpus and self.retrieval_config.mode == "hybrid" else None
+        self._prepare_failure: str | None = None
         self.selector = EvidenceSelector(llm_config) if llm_config else None
         self.model_name = llm_config.model if llm_config else "lexical-extractive-baseline"
+
+    async def prepare_retrieval(self, *, timeout_budget_ms: int = 120000) -> None:
+        """Build the shared dense index once, before the submission worker pool."""
+        if self.hybrid is None:
+            return
+        try:
+            await self.hybrid.prepare(timeout_budget_ms=timeout_budget_ms)
+        except EmbeddingUnavailable as error:
+            # Do not repeat a failed full-corpus API call for every test question.
+            self._prepare_failure = error.code
 
     def validate_result(self, result: ConsultationResult) -> None:
         if self.selector and self.selector.config.generation_mode == "grounded":
@@ -143,16 +168,18 @@ class LocalConsultationCore:
 
     async def consult(self, request: ConsultationRequest) -> ConsultationResult:
         started = time.perf_counter()
-        timings = dict.fromkeys(("retrieval", "rerank", "generation", "validation"), 0.0)
+        timings = dict.fromkeys(("retrieval", "rerank", "generation", "review", "validation"), 0.0)
         latest, context = _query_parts(request)
         query = f"{latest}\nКонтекст:\n{context}" if context else latest
         mode = self.selector.config.generation_mode if self.selector else "extractive"
+        retrieval_metadata = {"retrieval_mode": "not_run"}
 
         def result(kind: str, text: str, reason: str, evidence: list[Evidence] | None = None) -> ConsultationResult:
             candidate = ConsultationResult(
                 kind=kind, answer_text=text, reason_code=reason, retrieval_query=query,
                 evidence=evidence or [], timings_ms=timings.copy(),
-                model_metadata={"model": self.model_name, "corpus_version": self.corpus_version, "mode": mode},
+                model_metadata={"model": self.model_name, "corpus_version": self.corpus_version, "mode": mode,
+                                **retrieval_metadata},
             )
             validation_start = time.perf_counter()
             try:
@@ -170,9 +197,9 @@ class LocalConsultationCore:
 
         if INJECTION.search(latest) or DOCUMENT_DUMP.search(latest):
             return result("insufficient_knowledge", SAFE_RESPONSES["injection"], "untrusted_instruction")
-        if OUT_OF_SCOPE.search(latest):
+        if mode != "grounded" and OUT_OF_SCOPE.search(latest):
             return result("out_of_scope", SAFE_RESPONSES["scope"], "outside_scope")
-        if BILL_CHANGE.search(latest) and not BILL_DETAILS.search(latest + " " + context):
+        if mode != "grounded" and BILL_CHANGE.search(latest) and not BILL_DETAILS.search(latest + " " + context):
             return result("clarify", SAFE_RESPONSES["bill"], "missing_material_context")
         if not tokens(latest) or (len(tokens(latest)) < 2 and not context) or re.fullmatch(r"\s*(?:привет|здравствуйте|добрый день|помогите)[.!?\s]*", latest, re.I):
             return result("clarify", SAFE_RESPONSES["clarify"], "missing_material_context")
@@ -182,28 +209,89 @@ class LocalConsultationCore:
             raise CorpusNotReady("The requested corpus version differs from the loaded index")
 
         retrieval_start = time.perf_counter()
-        hits = self.retriever.search(latest, context=context, limit=10)
+        if self.hybrid and not self._prepare_failure:
+            remaining_ms = request.timeout_budget_ms - (retrieval_start - started) * 1000
+            # Keep most of a short web turn's budget for answer generation.
+            retrieval_budget = max(1, int(min(self.retrieval_config.timeout_seconds * 1000, remaining_ms * 0.4)))
+            searched = await self.hybrid.search(
+                latest, context=context, limit=self.retrieval_config.candidate_pool,
+                timeout_budget_ms=retrieval_budget,
+            )
+            hits = searched.hits
+            retrieval_metadata["retrieval_mode"] = searched.mode
+            retrieval_metadata["embedding_model"] = searched.embedding_model or "none"
+            if searched.fallback_reason:
+                retrieval_metadata["retrieval_fallback"] = searched.fallback_reason
+            timings.update({"retrieval_" + name: value for name, value in searched.timings_ms.items()})
+        else:
+            hits = self.retriever.search(latest, context=context, limit=self.retrieval_config.candidate_pool)
+            retrieval_metadata["retrieval_mode"] = "lexical_fallback" if self._prepare_failure else "bm25"
+            if self._prepare_failure:
+                retrieval_metadata["retrieval_fallback"] = self._prepare_failure
         candidates = [
             hit for hit in hits if len(hit.chunk.text) <= 10000
             and not UNTRUSTED_INSTRUCTIONS.search(hit.chunk.title + "\n" + hit.chunk.text)
         ]
         timings["retrieval"] = (time.perf_counter() - retrieval_start) * 1000
-        if _conflicting_prices(candidates, latest, context):
+        potential_price_conflict = _conflicting_prices(candidates, latest, context)
+        if mode != "grounded" and potential_price_conflict:
             return result("insufficient_knowledge", SAFE_RESPONSES["conflict"], "conflicting_evidence")
 
         if self.selector and mode == "grounded":
             generation_start = time.perf_counter()
             remaining = request.timeout_budget_ms - (generation_start - started) * 1000
+            selected = candidates[:self.retrieval_config.top_k]
+            if not selected:
+                return result("insufficient_knowledge", SAFE_RESPONSES["missing"], "missing_evidence")
+            generated = None
+            # Reserve time for one source review or structured-output recovery.
+            # No extra retrieval, model or unbounded repair loop is introduced.
             try:
-                generated = await self.selector.generate(query, request, candidates[:5], remaining)
+                generated = await self.selector.generate(query, request, selected, remaining * 0.8)
+            except ConsultationUnavailable:
+                retrieval_metadata["initial_output_error"] = "model_unavailable"
+            except InvalidModelOutput as error:
+                retrieval_metadata["initial_output_error"] = error.code
             except InvalidEvidence:
-                timings["generation"] = (time.perf_counter() - generation_start) * 1000
-                return result("insufficient_knowledge", SAFE_RESPONSES["invalid"], "invalid_generated_evidence")
+                retrieval_metadata["initial_output_error"] = "invalid_generated_evidence"
             timings["generation"] = (time.perf_counter() - generation_start) * 1000
+            direct = False
+            if generated is not None and generated.kind == "answer":
+                try:
+                    direct = is_verbatim_supported(generated, self.corpus) and not potential_price_conflict
+                except InvalidEvidence:
+                    pass  # The source reviewer can correct an invalid draft.
+            if direct:
+                retrieval_metadata["answer_review"] = "verbatim"
+            else:
+                review_start = time.perf_counter()
+                remaining = request.timeout_budget_ms - (review_start - started) * 1000
+                review_failure = None
+                try:
+                    reviewed = await self.selector.review(query, request, selected, remaining, draft=generated)
+                    if reviewed.kind == "answer":
+                        self.validate_result(reviewed)
+                except ConsultationUnavailable:
+                    retrieval_metadata["answer_review"] = "unavailable"
+                    review_failure = "answer_review_unavailable"
+                except InvalidModelOutput as error:
+                    retrieval_metadata["answer_review"] = "invalid"
+                    review_failure = error.code
+                except InvalidEvidence:
+                    retrieval_metadata["answer_review"] = "invalid"
+                    review_failure = "answer_review_invalid"
+                finally:
+                    timings["review"] = (time.perf_counter() - review_start) * 1000
+                if review_failure:
+                    return result("insufficient_knowledge", SAFE_RESPONSES["invalid"], review_failure)
+                retrieval_metadata["answer_review"] = "recovered" if generated is None else "corrected_or_confirmed"
+                generated = reviewed
             if generated.kind == "answer":
                 return result("answer", generated.answer_text, generated.reason_code, generated.evidence)
             if generated.kind == "clarify":
                 question = CLARIFY_RESPONSES.get(generated.answer_text, CLARIFY_RESPONSES["generated_clarify"])
+                if generated.answer_text in CLARIFY_RESPONSES.values():
+                    question = generated.answer_text
                 if any(message.role == "assistant" and message.text == question for message in request.messages[-5:]):
                     return result("insufficient_knowledge", SAFE_RESPONSES["missing"], "missing_evidence")
                 return result("clarify", question, generated.reason_code)
@@ -233,5 +321,8 @@ class LocalConsultationCore:
         return result("answer", render_excerpts([selected.chunk.text]), "grounded_excerpt", evidence)
 
 
-def build_core(index_dir: str | Path, *, llm_config: LLMConfig | None = None) -> LocalConsultationCore:
-    return LocalConsultationCore(index_dir, llm_config=llm_config)
+def build_core(index_dir: str | Path, *, llm_config: LLMConfig | None = None,
+               platform: bool = False) -> LocalConsultationCore:
+    retrieval = RetrievalConfig.from_env(enabled=llm_config is not None)
+    provider = OpenAIEmbeddingClient(EmbeddingConfig.from_env(platform=platform, llm_config=llm_config)) if retrieval.mode == "hybrid" else None
+    return LocalConsultationCore(index_dir, llm_config=llm_config, retrieval_config=retrieval, embedding_provider=provider)

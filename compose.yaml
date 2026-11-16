@@ -1,10 +1,28 @@
 services:
+  db:
+    image: postgres:17.12-alpine
+    environment:
+      POSTGRES_USER: energytool
+      POSTGRES_DB: energytool
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-energytool-local}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "energytool", "-d", "energytool"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
   api:
     build: .
+    depends_on:
+      db:
+        condition: service_healthy
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:${API_PORT:-8000}:8000"
     environment:
-      DATABASE_PATH: /data/energytool.db
+      DATABASE_URL: ${DATABASE_URL:-postgresql://energytool@db:5432/energytool}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-energytool-local}
       INDEX_DIR: /private/index
       REVIEW_TOKEN: ${REVIEW_TOKEN:-}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
@@ -23,13 +41,28 @@ services:
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      BASE_URL: ${BASE_URL:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-}
       GEN_MODEL: ${GEN_MODEL:-}
       TEMPERATURE: ${TEMPERATURE:-0}
       MAX_TOKENS: ${MAX_TOKENS:-2048}
+      RETRIEVAL_MODE: ${RETRIEVAL_MODE:-hybrid}
+      TOP_K: ${TOP_K:-6}
+      RETRIEVAL_CANDIDATES: ${RETRIEVAL_CANDIDATES:-20}
+      RRF_K: ${RRF_K:-60}
+      LEXICAL_WEIGHT: ${LEXICAL_WEIGHT:-1}
+      DENSE_WEIGHT: ${DENSE_WEIGHT:-1}
+      RETRIEVAL_TIMEOUT_SECONDS: ${RETRIEVAL_TIMEOUT_SECONDS:-8}
+      EMB_MODEL: ${EMB_MODEL:-baai/bge-m3}
+      EMBEDDER_API_KEY: ${EMBEDDER_API_KEY:-}
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-32}
+      EMBEDDING_TIMEOUT_SECONDS: ${EMBEDDING_TIMEOUT_SECONDS:-30}
+      EMBEDDING_MAX_RETRIES: ${EMBEDDING_MAX_RETRIES:-2}
+      EMBEDDING_MODEL_REVISION: ${EMBEDDING_MODEL_REVISION:-}
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-}
+      EMBEDDING_CACHE_DIR: ${EMBEDDING_CACHE_DIR:-}
     volumes:
-      - energytool_data:/data
       - type: bind
         source: ${INDEX_DIR_HOST:-./private/index}
         target: /private/index
@@ -41,4 +74,4 @@ services:
       retries: 3
     restart: unless-stopped
 volumes:
-  energytool_data:
+  postgres_data:
