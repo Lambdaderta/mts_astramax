@@ -18,6 +18,19 @@ function transport(responses: (Response | Error)[]) {
 }
 const contact = { fullName: '', phone: '+7 999 000-00-00', company: '', consent: true };
 describe('API из OpenAPI', () => {
+  it('загружает архив из истории API и экспортирует переписку без доступа к чужим сессиям', async () => {
+    const history = { items: [greeting, completed().user_message, completed().assistant_message], next_after_seq: null };
+    const fetch = transport([json(created, 201), json(completed()), json({ session: state() }), json(history), json({ session: state() }), json(history), json({ draft })]);
+    const service = createApiService({ fetch });
+    await service.createSession(); await service.sendMessage(sid, 'Вопрос');
+    const entries = await service.listArchive();
+    expect(entries).toMatchObject([{ id: sid, name: 'Вопрос' }]);
+    const blob = await service.downloadArchive(sid);
+    const content = await new Promise<string>(resolve => { const reader = new FileReader(); reader.onload = () => resolve(reader.result as string); reader.readAsText(blob); });
+    expect(content).toContain('Ответ сервера'); expect(content).toContain('+79990000000');
+    await expect(service.downloadArchive('foreign-session')).rejects.toBeInstanceOf(ApiError);
+    expect(fetch).toHaveBeenCalledTimes(7);
+  });
   it('создаёт одну сессию при повторной инициализации и не сохраняет секрет в storage', async () => {
     const fetch = transport([json(created, 201)]);
     const service = createApiService({ fetch });

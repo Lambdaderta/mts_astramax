@@ -233,8 +233,27 @@ export function createApiService(options: ApiServiceOptions = {}): ChatService {
     },
     async listReviewLeads() { return paginated<Schema['ReviewLeadPage']['items'][number]>('/leads'); },
     async getReviewLead(id) { return (await reviewRequest<Schema['ReviewLead']>(`/leads/${encode(id)}`)).lead; },
-    async listArchive() { throw new ApiError('В API консультанта нет архива файлов. Демонстрация архива доступна в разделе макетов.', 'NOT_SUPPORTED', 404, false); },
-    async downloadArchive() { throw new ApiError('Скачивание файлов не описано в API консультанта.', 'NOT_SUPPORTED', 404, false); },
+    async listArchive() {
+      // Only sessions whose owner token is held by this client are accessible.
+      const history = await Promise.all([...sessions.keys()].map(id => service.getSession!(id)));
+      return history.filter(item => item.messages.some(message => message.role === 'user')).reverse().map(item => ({
+        id: item.id, name: item.title, date: item.createdAt,
+        user: item.apiLead ? 'Заявка сохранена' : item.draft?.phone ? 'Черновик заявки' : 'Без заявки',
+      }));
+    },
+    async downloadArchive(id) {
+      const session = await service.getSession!(id);
+      const draft = await service.getDraft!(id);
+      const rows: string[][] = [['Тип', 'Содержание'], ['Диалог', session.title], ['Дата', session.createdAt],
+        ...session.messages.map(message => [message.role === 'user' ? 'Клиент' : 'Помощник', message.text])];
+      const contact = session.apiLead ?? draft;
+      for (const [label, value] of [['ФИО', contact.full_name], ['Телефон', contact.phone], ['Компания', contact.company]]) {
+        if (value) rows.push([label!, value]);
+      }
+      if (session.apiLead) rows.push(['Заявка', session.apiLead.id], ['Задача', session.apiLead.client_problem], ['Резюме', session.apiLead.summary]);
+      const cell = (value: string) => '"' + (/^[\s]*[=+@-]/u.test(value) ? "'" + value : value).replaceAll('"', '""') + '"';
+      return new Blob(['\uFEFF' + rows.map(row => row.map(cell).join(',')).join('\r\n')], { type: 'text/csv;charset=utf-8' });
+    },
   };
   return service;
 }

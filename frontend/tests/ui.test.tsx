@@ -9,6 +9,15 @@ import { demoFixture, memoryStorage } from '../src/demo';
 import type { SendOptions } from '../src/types';
 
 describe('Рабочий интерфейс', () => {
+  it('показывает рабочий архив консультанта без пунктов устройств и демонстрационных ошибок', async () => {
+    const service = { ...createMockService(memoryStorage([]), 0), mode: 'api' as const, listArchive: async () => [] };
+    render(<MemoryRouter><Archive service={service} /></MemoryRouter>);
+    await screen.findByText(/Пока нет сохранённых диалогов/);
+    expect(screen.getByRole('heading', { name: 'Архив диалогов' })).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Устройства' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Управление' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Начать консультацию' })).toBeVisible();
+  });
   it('смена диалога отменяет отправку и игнорирует поздний прогресс', async () => {
     const user = userEvent.setup();
     const service = createMockService(memoryStorage(demoFixture('products')), 0);
