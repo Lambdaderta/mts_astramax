@@ -44,7 +44,8 @@ def create_session(client):
 def test_postgres_shared_turn_progress_concurrent_confirmation_and_restart(postgres_url):
     settings = Settings(database_url=postgres_url, sync_wait_seconds=0, review_token='pg-test-review')
     core = DelayedCore()
-    payload = {'client_message_id': str(uuid4()), 'text': 'Какой тариф на газ?'}
+    payload = {'client_message_id': str(uuid4()), 'text': 'Почему вырос счёт за газ и какой тариф действует?'}
+    keywords = ['Газ', 'Рост расходов', 'Тарифы']
     with TestClient(create_app(settings, core)) as first, TestClient(create_app(settings, core)) as second:
         assert first.get('/health/ready').status_code == 200
         path, headers = create_session(first)
@@ -53,13 +54,14 @@ def test_postgres_shared_turn_progress_concurrent_confirmation_and_restart(postg
         query = {'include_progress': 'true'}
         accepted = first.post(path + '/turns', json=payload, headers=headers, params=query)
         assert accepted.status_code == 202, accepted.text
+        assert accepted.json()['progress']['keywords'] == keywords
         turn_path = f"{path}/turns/{accepted.json()['turn_id']}"
         try:
             assert core.entered.wait(3)
             polled = second.get(turn_path, headers=headers, params=query)
             assert polled.status_code == 202, polled.text
             assert polled.json()['progress'] == {
-                'stage': 'preparing_answer', 'keywords': ['Газ', 'Тарифы'],
+                'stage': 'preparing_answer', 'keywords': keywords,
             }
             duplicate = second.post(path + '/turns', json=payload, headers=headers)
             assert duplicate.status_code == 202

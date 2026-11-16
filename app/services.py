@@ -167,23 +167,29 @@ class Service:
                     return dict(old),False
                 self.active(c,sid)
                 self.idle(c,sid)
-                last=c.execute("SELECT id FROM messages WHERE session_id=? AND role='user' ORDER BY seq DESC LIMIT 1",(sid,)).fetchone()
-                if last['id']!=old['user_message_id']:
+                message=c.execute("SELECT id,seq FROM messages WHERE session_id=? AND role='user' ORDER BY seq DESC LIMIT 1",(sid,)).fetchone()
+                if message['id']!=old['user_message_id']:
                     raise APIError(409,'RETRY_SUPERSEDED','После этой реплики начат новый запрос. Повторите вопрос новым сообщением.')
-                c.execute("""UPDATE turns SET status='processing',attempt=attempt+1,lease_until=?,
-                    error_code=NULL,retryable=0,progress_stage='queued',progress_keywords='[]' WHERE id=?""",
-                    (time.time()+self.settings.turn_lease_seconds,old['id']))
-                tid=old['id']
             else:
                 self.active(c,sid)
                 self.idle(c,sid)
                 message=self.append_message(c,sid,'user',text)
-                tid=uid()
-                c.execute('INSERT INTO turns(id,session_id,client_message_id,request_hash,status,user_message_id,lease_until,created_at) VALUES (?,?,?,?,?,?,?,?)',
-                          (tid,sid,client_id,fingerprint,'processing',message['id'],time.time()+self.settings.turn_lease_seconds,now()))
                 self.update_contacts(c,sid,extract_contacts(text))
-                draft,known_values=self.contact_context(c,sid)
-                messages=self.recent_context(c,sid,message['seq'],draft,known_values)
+
+            draft,known_values=self.contact_context(c,sid)
+            messages=self.recent_context(c,sid,message['seq'],draft,known_values)
+            keywords=packed(progress_keywords(messages))
+            lease_until=time.time()+self.settings.turn_lease_seconds
+            if old:
+                tid=old['id']
+                c.execute("""UPDATE turns SET status='processing',attempt=attempt+1,lease_until=?,
+                    error_code=NULL,retryable=0,progress_stage='queued',progress_keywords=? WHERE id=?""",
+                    (lease_until,keywords,tid))
+            else:
+                tid=uid()
+                c.execute('''INSERT INTO turns(id,session_id,client_message_id,request_hash,status,user_message_id,
+                             lease_until,created_at,progress_keywords) VALUES (?,?,?,?,?,?,?,?,?)''',
+                          (tid,sid,client_id,fingerprint,'processing',message['id'],lease_until,now(),keywords))
                 previous_facts=self.facts(c,sid,draft,known_values)
                 fact=meter_count(messages[-1],active_topic(messages),previous_facts)
                 if fact:
@@ -285,11 +291,11 @@ class Service:
                            for row in sorted(older,key=lambda row:row['seq'])]
         return session,latest,older_context+messages,draft,known_values,topic,facts
 
-    def update_turn_progress(self, turn, stage, keywords):
+    def update_turn_progress(self, turn, stage):
         with self.db.transaction(session_id=turn['session_id']) as c:
-            return bool(c.execute("""UPDATE turns SET progress_stage=?,progress_keywords=?
+            return bool(c.execute("""UPDATE turns SET progress_stage=?
                 WHERE id=? AND attempt=? AND status='processing' AND lease_until>?""",
-                (stage,packed(keywords),turn['id'],turn['attempt'],time.time())).rowcount)
+                (stage,turn['id'],turn['attempt'],time.time())).rowcount)
 
     async def run_turn(self,turn,request_id):
         started=time.perf_counter()
@@ -297,7 +303,7 @@ class Service:
         event={'session_id':sid,'turn_id':tid,'request_id':request_id,
                'corpus_version':self.core.corpus_version,'attempt':attempt}
         try:
-            if not await asyncio.to_thread(self.update_turn_progress,turn,'analyzing',[]):
+            if not await asyncio.to_thread(self.update_turn_progress,turn,'analyzing'):
                 return
             session,latest,messages,draft,known_values,topic,facts=await asyncio.to_thread(
                 self.turn_context,sid,turn['user_message_id'])
@@ -305,7 +311,6 @@ class Service:
             contact_reply=(session['phase'] in {'collecting_contacts','reviewing_lead'} and
                            bool(extract_contacts(latest['text'])) and not lead_context(latest_text))
             contact_flow=manager_requested(latest['text']) or contact_reply
-            keywords=progress_keywords(latest_text,topic)
             if contact_flow:
                 missing=draft['missing_fields']
                 labels={'full_name':'ФИО','phone':'телефон','company':'название компании'}
@@ -318,7 +323,7 @@ class Service:
                     latest_user_text=latest_text,messages=messages,active_topic=topic,facts=facts,
                     current_phase=session['phase'],corpus_version=event['corpus_version'],
                     timeout_budget_ms=int(self.settings.ml_timeout_seconds*1000))
-                if not await asyncio.to_thread(self.update_turn_progress,turn,'preparing_answer',keywords):
+                if not await asyncio.to_thread(self.update_turn_progress,turn,'preparing_answer'):
                     return
                 try:
                     result=await asyncio.wait_for(self.core.consult(request),timeout=self.settings.ml_timeout_seconds)
@@ -340,7 +345,7 @@ class Service:
                    'model_metadata':{key:redact(value,draft,known_values) for key,value in result.model_metadata.items()
                                      if key in {'model','mode','corpus_version'}},
                    'recommended_products':[redact(value,draft,known_values) for value in result.recommended_products]}
-            if not await asyncio.to_thread(self.update_turn_progress,turn,'finalizing',keywords):
+            if not await asyncio.to_thread(self.update_turn_progress,turn,'finalizing'):
                 return
             storage_started=time.perf_counter()
             completed=await asyncio.to_thread(self.complete_turn,turn,latest,result.answer_text,phase,

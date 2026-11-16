@@ -3,6 +3,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .privacy import normalize_phone
+from .progress import MAX_PROGRESS_KEYWORDS, ProgressKeyword
 
 
 class Model(BaseModel):
@@ -124,7 +125,7 @@ class TurnCompleted(Model):
 
 class TurnProgress(Model):
     stage: Literal['queued','analyzing','preparing_answer','finalizing']
-    keywords: list[Literal['Электроэнергия','Вода','Тепло','Газ','Счётчики','Тарифы']]
+    keywords: list[ProgressKeyword] = Field(max_length=MAX_PROGRESS_KEYWORDS)
 
 
 class TurnProcessing(Model):
