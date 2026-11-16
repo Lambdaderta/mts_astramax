@@ -121,6 +121,6 @@ docker run -d --name energytool-frontend --restart unless-stopped -p 8080:80 --a
 docker run -d --name energytool-frontend --restart unless-stopped -p 8080:80 --network ИМЯ_СЕТИ_COMPOSE energytool-frontend
 ```
 
-Имя сети можно посмотреть через `docker network ls`; стандартное имя — `<имя-проекта>_default`. В этом варианте Nginx проксирует `/api/` на `http://api:8000`, и публикация бэкенда на localhost не мешает. Корневой Compose теперь запускает фронтенд, API и PostgreSQL одной командой: `docker compose up -d --build`. Инструкция по [Dokploy](../docs/dokploy.md).
+Имя сети можно посмотреть через `docker network ls`; стандартное имя — `<имя-проекта>_default`. В этом варианте Nginx проксирует `/api/` на `http://api:8000`, и публикация бэкенда на localhost не мешает. Корневой Compose теперь запускает фронтенд, API и PostgreSQL одной командой: `docker compose up -d --build`. Инструкция по общему запуску — в [корневом README](../README.md).
 
 Локальные `.env`-файлы не включаются в образ. Для отдельного публичного API можно передать `--build-arg VITE_API_BASE_URL=https://api.example.ru/api/v1`. Это публичная настройка, встроенная в сборку. Ключи LLM остаются только в окружении бэкенда. Review выключен по умолчанию; для локальной проверки Compose поддерживает `ENABLE_REVIEW=true` и серверный `REVIEW_TOKEN`.

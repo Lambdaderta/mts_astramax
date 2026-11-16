@@ -1,181 +1,95 @@
-# MTS Energytool: backend and RAG
+# МТС Energytool — ИИ-консультант
 
-A working backend and initial RAG implementation for the Energytool sales-consultant case. The product must understand a business customer's energy problem, consult the organizer's knowledge base, ask useful follow-up questions and save a manager enquiry with contacts and a summary. Training a new language model is not required.
+Веб-консультант помогает разобраться с задачей по энергоресурсам, находит сведения в выданной базе знаний и формирует заявку с контактами и резюме диалога. Заявка сохраняется внутри решения; отправка в CRM или почту не выполняется.
 
-The supplied team specification was used for the REST design. During implementation, the organizer's linked technical regulation, 19-document knowledge archive, 18 demo questions, output examples and sample submission were recovered. The platform adapter follows that recovered CSV contract. Original machine-readable team contracts were absent, so the included REST/TypeScript/ML contracts are reconstructed and need comparison before claiming compatibility with an existing frontend.
+## Архитектура
 
-## Run
+- React + TypeScript: чат, история текущих сессий, форма контактов и предпросмотр заявки.
+- Nginx: раздача интерфейса и проксирование API на одном домене.
+- FastAPI: изолированные сессии, асинхронные ответы, повтор запросов без дубликатов, заявки и защищённая история для проверки.
+- PostgreSQL: сообщения, заявки, источники ответов и этапы обработки.
+- RAG: BM25 или гибридный поиск с эмбеддингами; генерация и проверка ответа по найденным источникам через OpenAI-совместимый API.
 
-### Complete application / Dokploy
+При отсутствии подтверждающих сведений консультант сообщает об ограничении. Смена диалога сбрасывает контекст, история остаётся в БД.
 
-`docker compose up -d --build` starts the frontend at `http://localhost:8080`, the API and PostgreSQL. The frontend proxies API requests on the same origin. See [Dokploy setup](docs/dokploy.md) for configuration, private-corpus ingestion and domain setup, and [case checklist](docs/case-status.md) for remaining delivery work.
+## Запуск
 
-### Frontend
+Нужны Docker Engine и Docker Compose. Для консультации нужны выданные организаторами документы и доступ к модели.
 
-The React + TypeScript frontend is in [`frontend/`](frontend/README.md). Requires Node.js 22.12+ or 24+:
+1. Скопируйте `.env.dokploy.example` в `.env` для ProxyAPI либо используйте `.env.example` для другого провайдера.
+2. Задайте `POSTGRES_PASSWORD` и `LLM_API_KEY`. Пароль PostgreSQL задаётся при создании БД; существующую БД нужно подключать с её прежним паролем.
+3. Укажите `CORPUS_DIR_HOST`: путь к распакованной базе знаний вне репозитория. Поддерживаются Markdown, TXT, JSON/JSONL и текстовые PDF. Контейнерный UID 10001 должен иметь право чтения документов и прохода по каталогам.
+4. Запустите приложение:
 
-```bash
+```sh
+docker compose up -d --build
+```
+
+5. При первом запуске или обновлении документов соберите индекс:
+
+```sh
+docker compose --profile tools run --build --rm --no-deps ingest
+docker compose restart api
+```
+
+Интерфейс: `http://localhost:8080`. Swagger: `http://localhost:8000/docs`.
+
+В Dokploy выберите репозиторий, ветку `main`, тип Docker Compose, путь `./compose.yaml` и Isolated Deployments. Переменные из примера вставляются в Environment. Домен назначается сервису `frontend`, внутреннему порту `80`, пути `/` с HTTPS. При ручном запуске команд на сервере используйте тот же каталог, Environment и `-p PROJECT_NAME`, что указаны в команде Dokploy, чтобы работать с теми же томами.
+
+## Переменные окружения
+
+| Переменная | Назначение |
+| --- | --- |
+| `POSTGRES_PASSWORD` | Пароль внутренней БД; Compose передаёт его API автоматически |
+| `LLM_ENABLED` | Включает вызовы языковой модели |
+| `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` | Адрес, ключ и идентификатор модели |
+| `ALLOW_PRIVATE_CORPUS_TO_LLM` | Явное разрешение передавать фрагменты базы выбранному провайдеру |
+| `RETRIEVAL_MODE` | `bm25` или `hybrid` |
+| `EMB_MODEL` | Модель эмбеддингов выбранного провайдера |
+| `EMBEDDER_API_KEY` | Необязательный отдельный ключ; иначе используется ключ LLM |
+| `CORPUS_DIR_HOST` | Папка с выданными документами для команды импорта |
+| `ML_TIMEOUT_SECONDS`, `TURN_LEASE_SECONDS` | Бюджет обработки и срок захвата операции; второй должен быть больше первого |
+| `ENABLE_REVIEW`, `REVIEW_TOKEN` | Режим проверки истории и источников; выключен по умолчанию |
+| `API_PORT`, `FRONTEND_PORT` | Локальные порты API и интерфейса; по умолчанию 8000 и 8080 |
+
+Пример ProxyAPI: `https://api.proxyapi.ru/v1`, `qwen/qwen3.8-27b`, `openai/text-embedding-3-small`. На платформе организаторов используются предоставленные ею параметры. Зависимости закреплены в `requirements.lock` и `frontend/package-lock.json`. Полный список настроек — в `.env.example`.
+
+## Хранение и диагностика
+
+Именованные тома `postgres_data`, `knowledge_index` и `embedding_cache` сохраняют БД, индекс и эмбеддинги между пересборками. API читает индекс только для чтения; команда `ingest` записывает его. Секреты, исходные материалы и индексы не входят в Git и Docker-образы.
+
+- `/health/live` проверяет процесс API.
+- `/health/ready` проверяет БД и загруженный индекс; без индекса возвращает 503.
+- Сообщение «База знаний пока не подключена» означает, что индекс отсутствует или не загрузился. Выполните импорт и перезапустите API.
+- После изменения документов индекс пересобирается, API перезапускается.
+
+Режим проверки показывает историю, время ответа и использованные документы. Для локального доступа задайте `ENABLE_REVIEW=true`, непустой `REVIEW_TOKEN` и пересоберите фронтенд. На публичном домене доступ к этому режиму должен ограничиваться внешней авторизацией: сам серверный шлюз не проверяет личность посетителя. Токен в JavaScript не передаётся.
+
+## Проверка основного сценария
+
+Задайте вопрос о продуктовой задаче, ответьте на уточнение и попросите связаться со специалистом. Заполните ФИО, телефон и компанию, проверьте резюме и подтвердите заявку. Проверьте смену темы, начало нового диалога и сохранность заявки после перезапуска. Используйте выдуманные контактные данные.
+
+```sh
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
 cd frontend
 npm ci
-npm run dev
+npm test
+npm run build:api
 ```
 
-The default mode uses local mocks. To use the backend on port 8000, create `frontend/.env.local` with `API_PROXY_TARGET=http://127.0.0.1:8000`, then run `npm run dev:api` from `frontend/`. Open `http://localhost:5173`. See the frontend README for production builds, API configuration, and tests.
+PostgreSQL-интеграционные тесты требуют отдельной тестовой БД в `TEST_POSTGRES_URL`. На Windows для Python-проверок используйте UTF-8 (`PYTHONUTF8=1`). Синтетические тесты проверяют поведение приложения, но не заменяют оценку качества живой модели.
 
-### Backend
+## Автоматическая оценка
 
-Python 3.12:
+`solution.py` — отдельная точка входа для платформы. Вход: `DATA_DIR/questions.csv` и `DATA_DIR/knowledge-base.zip`; результат — `submission.csv` с колонками `id,answer`. Контекст между строками не переносится. Web API и адаптер используют общее ядро консультации.
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.lock
-uvicorn app.main:app --host 127.0.0.1 --port 8000 --no-access-log
-```
-
-Open `http://127.0.0.1:8000/docs` for the interactive API contract. This is API documentation, not the final chat frontend.
-
-Docker:
-
-```bash
-docker compose up --build
-```
-
-The API binds to localhost port 8000 (`API_PORT` overrides it). Compose starts PostgreSQL 17 on its internal network and stores its data in `postgres_data`. The default password is for local use. Set `POSTGRES_PASSWORD` for a shared instance, or provide `DATABASE_URL` for a managed PostgreSQL database. The direct Python command uses `DATABASE_URL` if set, or the local SQLite file from `DATABASE_PATH` otherwise.
-
-The private index is mounted read-only from the `knowledge_index` named volume; embeddings persist in `embedding_cache`. Set `CORPUS_DIR_HOST` to the directory containing the issued documents, run `docker compose --profile tools run --build --rm --no-deps ingest`, then restart the API. Without an index, session and contact workflows remain available and `/health/ready` returns 503. `/health/live` checks the running process. See [validation results](docs/validation.md) for historical container checks and [Dokploy setup](docs/dokploy.md) for the new deployment configuration.
-
-### Import existing SQLite history
-
-Use an empty PostgreSQL database. Stop the old API and make a consistent SQLite backup before switching. The import copies existing history, sessions, and leads while keeping the original file readable. Session tokens and existing request IDs still work after the import. The importer rejects a destination with application data.
-
-```bash
-docker compose build api
-docker compose run --rm --volume /absolute/path/to/backup:/legacy:ro \
-  --entrypoint python api scripts/migrate_sqlite_to_postgres.py \
-  --sqlite-path /legacy/energytool.db
-docker compose up -d
-```
-
-For a PostgreSQL server accessible from the host, run the same Python script with `DATABASE_URL` exported and pass the local backup path. Verify existing conversations before discarding the old SQLite volume.
-
-To ingest an authorized local corpus:
-
-```bash
-python scripts/ingest.py --corpus-dir /path/to/private/corpus --index-dir private/index
-```
-
-Restart the API after rebuilding the index. Supported formats are Markdown, text, structured JSON/JSONL and text PDFs. The corpus and derived index contain private material: neither belongs in source control or either distributed ZIP. No real product knowledge is checked into this project.
-
-See [local workspace instructions](docs/local-workspace.md) for private mounts and offline evaluation.
-
-## Modes and configuration
-
-Default mode is local BM25 retrieval with conservative source excerpts. It performs no external model calls. With the real corpus it is a useful retrieval baseline, but its strict answer gate intentionally abstains often; it is not the competition-ready consultation mode.
-
-To enable grounded generation on an authorized proxy, set these environment variables (Compose reads a local `.env`; direct Uvicorn requires exported environment variables):
-
-```text
-LLM_ENABLED=true
-ALLOW_PRIVATE_CORPUS_TO_LLM=true
-LLM_BASE_URL=<authorized OpenAI-compatible base URL>
-LLM_API_KEY=<provided at runtime>
-LLM_MODEL=<provided at runtime>
-```
-
-The organizer supplies proxy credentials automatically on its platform. Environment aliases `BASE_URL`, `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL` and `GEN_MODEL` are supported by the shared client. Values are stripped, and an unset template value equal to its variable name is ignored, matching the organizer's sample. The web API requires an explicit opt-in to transmit corpus excerpts. TLS is required except for localhost or explicitly enabled internal HTTP (`LLM_ALLOW_INTERNAL_HTTP=true`). Redirects are refused. A single wall-clock budget covers model transport, response reads and transient retries. See `.env.example` for other settings.
-
-With generation enabled, retrieval defaults to BM25 plus dense cosine search, combined through reciprocal-rank fusion. `EMB_MODEL` selects the organizer embedding model (`baai/bge-m3` is the recovered sample default); it uses the same proxy and key, with optional `EMBEDDER_API_KEY`. The corpus is embedded once at startup. `TOP_K=6` passages reach the generator from 20 candidates per retrieval branch. Set `RETRIEVAL_MODE=bm25` for an ablation. Embedding failures produce a recorded lexical fallback. Optional vector caches belong in a writable private `EMBEDDING_CACHE_DIR`; by default vectors stay in memory. See [ML configuration and evaluation](app/ml/README.md).
-
-Set a private `REVIEW_TOKEN` to enable `/api/v1/review/*`. An empty token disables access. Generate it locally with `python -c "import secrets; print(secrets.token_urlsafe(32))"` and keep it out of frontend builds. `CORS_ORIGINS` allows explicit origins only. `REQUESTS_PER_MINUTE` limits requests per client address within one process. `MAX_BODY_BYTES` bounds incoming HTTP request bodies.
-
-## Implemented
-
-- FastAPI/Pydantic REST endpoints, Russian customer-facing messages, JSON errors and request IDs.
-- PostgreSQL persistence with per-session write serialization, per-session bearer token hashes, isolated append-only histories and protected review access. SQLite remains available for local development and import. Readiness verifies the database schema and index availability.
-- Durable turn acceptance, idempotent retries, asynchronous polling, one active turn per session enforced in the database, expiring leases and attempt fencing after a crashed worker. Failed model calls preserve the user message; failed response commits never report success.
-- Contacts entered through a versioned form or explicit chat labels; phone normalization; full and partial enquiries; persisted preview snapshots; stale-preview rejection; explicit idempotent confirmation. Saving is local, not delivery to a CRM or manager.
-- Historical explicit contact values remain redacted after correction or clearing. Raw history stays available only to the session owner and authorized review access. This is deterministic redaction, not a general PII detector.
-- Structured logs cover API responses, turn completion, model failures, retries, lead confirmations, and session closure. They carry operational IDs and durations. A log collector can aggregate the events and timing fields into counters and latency distributions.
-- A transport-independent consultation core, deterministic section-aware ingestion, corpus checksums, hybrid BM25/dense retrieval with relevant prior turns, measured stage timings and source traces. Grounded responses permit source-backed synthesis, with deterministic provenance checks and one bounded source-review/correction pass when needed. Complete supporting evidence is available to authorized reviewers; model review is not a formal guarantee of factual correctness.
-- Official `solution.py` CSV processing with independent contexts, safe runtime ZIP extraction, bounded concurrency, atomic output and a deterministic root-only submission packager. The API and platform use the same core.
-
-## API integration
-
-`openapi.yaml` is generated from the running implementation; `frontend-contract.ts` is generated from the same schemas. `ml_contract.py` re-exports the shared Python interface. Regenerate after schema changes:
-
-```bash
-python -m pip install -r requirements-dev.txt
-python scripts/export_contracts.py
-```
-
-Frontend flow:
-
-1. `POST /api/v1/sessions` with `{}`. Keep the returned session token in memory.
-2. Send `Authorization: Bearer <session_token>` for that session's endpoints.
-3. `POST /sessions/{id}/turns` with a UUID `client_message_id` and text. Retry with the **same ID and text** after an uncertain network result. Poll the returned turn on 202. A terminal failure has `retryable=false`; send a newly phrased message rather than replaying it indefinitely.
-4. Read/edit `/lead-draft` using `expected_revision`; omitted fields remain unchanged and explicit null clears a field.
-5. Create `/lead-preview`, display it, then confirm via `/leads` with `preview_id`, a stable `idempotency_key`, and `confirm:true`. Any new turn or contact change invalidates the preview.
-6. A new dialogue is a new session. Closing preserves history. Successful retries remain readable after closing; new changes are rejected.
-
-### Processing indicator
-
-Add `?include_progress=true` to `POST /api/v1/sessions/{id}/turns` and to the polling URL `GET /api/v1/sessions/{id}/turns/{turn_id}`. When the API returns `202`, render the newest `progress.stage` and optional topic labels from `progress.keywords`. Continue polling after `poll_after_ms` until a completed or failed response. A fast turn can return the final result immediately.
-
-| `progress.stage` | Example text for the chat |
-| --- | --- |
-| `queued` | Запрос принят |
-| `analyzing` | Учитываю контекст диалога |
-| `preparing_answer` | Готовлю ответ |
-| `finalizing` | Сохраняю результат |
-
-For a question about gas rates, `progress` can be `{"stage":"preparing_answer","keywords":["Газ","Тарифы"]}`. Labels come from a fixed list of topics and can be empty. The indicator describes processing while the final response is being prepared. Show it as transient status in the chat and replace it with the final result.
-
-A failed earlier turn cannot be retried after a newer user turn; the API returns `RETRY_SUPERSEDED`. Confirming the same preview with a different idempotency key returns `PREVIEW_ALREADY_CONFIRMED`, preventing duplicate leads. These additional rules are documented implementation choices.
-
-## Platform adapter
-
-Official input is `DATA_DIR/questions.csv` with `id,question` plus `DATA_DIR/knowledge-base.zip`; default `DATA_DIR` is `data`. Output is `./submission.csv`, exactly `id,answer`, one nonempty answer per unique input ID, at most 10,000 characters per answer. Published role-labelled dialogues are parsed with fresh context for every row.
-
-For compatibility with the official example, input lookup also checks script-relative `DATA_DIR` and the working directory, accepting `train.csv`, `knowledge_base.zip` and `kb.zip` aliases. Output is replaced atomically with mode `0644` so a separate grading process can read it. Private indexes and embedding caches retain their owner-only permissions. Sanitized progress markers report the runtime version, completed phases, substantive answer counts, outcome/reason histograms and processing failures without logging credentials, questions or source passages. Legitimate abstention is distinguished from invalid model output. One failed question retains a safe fallback and does not prevent other IDs from being written.
-
-```bash
-# Requires the organizer proxy environment variables.
-python solution.py
-
-# Explicit local baseline, not a scored model run:
-python solution.py --offline --data-dir /path/to/inputs --output /path/to/submission.csv
-
-# Produces a ZIP with only root-level Python modules and allowed dependencies:
+```sh
 python scripts/build_submission.py --output dist/submission.zip
 ```
 
-The packager rewrites shared module imports through Python's AST. It excludes web application code, corpus, index, questions, environment files and credentials. Dependencies in the platform ZIP are from the recovered allowed list. Input files are supplied by the platform, so no precomputed-index exception is needed. No submission was uploaded.
+Сборщик включает корневую точку входа, необходимые модули и зависимости, исключая корпус, ключи и данные пользователей. Поддерживаются переменные модели организаторов и их алиасы. Реальная оценка платформы и задержки зависят от провайдера и требуют отдельного прогона.
 
-`MAX_WORKERS` defaults to 3 and is capped at 8; `CONSULTATION_TIMEOUT_SECONDS` defaults to 120, and `SUBMISSION_TIMEOUT_SECONDS` to 1080, leaving room below the organizer's 20-minute limit. The model transport defaults to 90 seconds on the platform and 10 seconds in the web service; explicit `ML_TIMEOUT_SECONDS` overrides either default. It also honors `TEMPERATURE`, `MAX_TOKENS` and official access aliases. Check live service limits before tuning.
+## Ограничения
 
-## Verify
-
-```bash
-python -m pip install -r requirements-dev.txt
-python -m pytest -q
-python scripts/smoke.py --base-url http://127.0.0.1:8000
-```
-
-Set `TEST_POSTGRES_URL` to a disposable PostgreSQL database to include the PostgreSQL and SQLite import tests. The test role needs permission to create and drop test schemas. Each test uses its own schema. For example, when the test database is reachable on a local port:
-
-```bash
-TEST_POSTGRES_URL=postgresql://energytool@127.0.0.1:5432/energytool python -m pytest -q
-```
-
-The smoke script creates a synthetic enquiry on the running server. Tests use temporary databases and synthetic knowledge. Local fake-proxy tests open a loopback socket. The suite runs without model credentials and uses synthetic product content.
-
-See [validation results](docs/validation.md) for executed checks and their limits, and [requirements](docs/requirements-and-status.md) for the source distinction. `scripts/evaluate.py` compares BM25, dense and hybrid retrieval against versioned private relevance labels, reporting Recall/MRR/nDCG and required evidence-group coverage. It does not grade generated answers. Private labels, vectors and reports stay outside source control.
-
-## Remaining work
-
-Live Qwen response quality and latency remain unverified. Claim validation is deliberately conservative and can reject valid paraphrases. Product applicability, conditions spread across documents and source precedence still need evaluation on the issued corpus.
-
-Dialogue reasoning uses bounded history and stores explicit meter counts by resource with their source message. A later correction supersedes the previous value for that resource. General semantic facts, structured product recommendations and model-based reranking remain open. Manager summaries use the latest substantive customer messages, retained facts and the latest outstanding consultation question when available.
-
-The integrated frontend and deployment configuration are now included. Remaining work is live-model acceptance, an actual Dokploy deployment, platform scoring and the final presentation; see the [current case checklist](docs/case-status.md). A real CRM connection is not required by the case.
+Без модели работает консервативный локальный режим. Без базы продуктовые ответы недоступны. История модели ограничена последними сообщениями и сохранёнными фактами; сложные возвращения к давним темам требуют проверки. `/demo` содержит вымышленные данные и демонстрационные показатели. Произвольные неподтверждённые факты модели не считаются источниками продуктовых сведений.

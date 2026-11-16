@@ -198,7 +198,7 @@ embedding service. Retrieval latency with precomputed vectors excludes encoder
 inference. The small official-demo/paraphrase benchmark is development data,
 not an unseen test or a substitute for the organizer's answer score. Keep
 corpus text, labels, vectors and full reports private. See
-[the current validation record](../../docs/validation.md) for measured results.
+[the project README](../../README.md) for measured results.
 
 `scripts/embed_local.py` also reproduces the normalized CLS ruBERT-tiny2
 diagnostic. That encoder made equal-weight fusion worse on the current labels;
