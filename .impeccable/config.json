@@ -1,0 +1,32 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "overused-font",
+        "value": "inter",
+        "createdAt": "2026-11-16T10:24:45.417Z",
+        "reason": "Agent: frontend/DESIGN.md documents Inter 400/500/600 from the Energytool Figma design."
+      },
+      {
+        "rule": "side-tab",
+        "value": "*",
+        "files": [
+          "frontend/src/App.module.css"
+        ],
+        "createdAt": "2026-11-16T10:24:45.434Z",
+        "reason": "Agent: the 3px .navActive marker in Archive.tsx identifies the active navigation section."
+      },
+      {
+        "rule": "pulsing-dot",
+        "value": "*",
+        "files": [
+          "frontend/dist-api/index.html"
+        ],
+        "createdAt": "2026-11-16T10:24:45.450Z",
+        "reason": "Agent: the three dots are the documented response indicator and appear while a chat turn is pending, with reduced-motion support."
+      }
+    ]
+  }
+}
