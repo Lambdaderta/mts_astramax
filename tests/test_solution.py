@@ -86,12 +86,14 @@ def test_csv_round_trip_and_atomic_validation(tmp_path):
     answer = 'Ответ с запятой, "кавычками"\nи новой строкой.'
     solution.write_submission(output, [("1", answer)])
     assert csv_answers(output) == [{"id": "1", "answer": answer}]
-    assert stat.S_IMODE(output.stat().st_mode) == 0o644
+    if os.name == 'posix':
+        assert stat.S_IMODE(output.stat().st_mode) == 0o644
     original = output.read_bytes()
     with pytest.raises(solution.SubmissionError):
         solution.write_submission(output, [("1", "x" * 10001)])
     assert output.read_bytes() == original
-    assert stat.S_IMODE(output.stat().st_mode) == 0o644
+    if os.name == 'posix':
+        assert stat.S_IMODE(output.stat().st_mode) == 0o644
     assert not list(tmp_path.glob("*.tmp"))
 
 
@@ -342,7 +344,10 @@ def test_direct_manager_request_skips_model_without_claiming_lead_was_saved():
 def test_archive_rejects_traversal_before_extracting(tmp_path, name):
     archive = tmp_path / "knowledge-base.zip"
     with ZipFile(archive, "w") as source:
-        source.writestr(name, SYNTHETIC)
+        entry = ZipInfo(name)
+        # Keep the malicious path verbatim: Windows normalizes it in __init__.
+        entry.filename = name
+        source.writestr(entry, SYNTHETIC)
     with pytest.raises(solution.SubmissionError, match="unsafe path"):
         solution.extract_knowledge(archive, tmp_path / "corpus")
     assert not (tmp_path / "escaped.md").exists()

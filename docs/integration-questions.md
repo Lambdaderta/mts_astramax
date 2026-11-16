@@ -33,4 +33,4 @@ The links were recovered from PDF annotations. Initial access failed, but an aut
 
 No external CRM is needed for this prototype. The original case explicitly permits storing the enquiry inside the solution. A successful local save must not be presented as delivery to an actual manager.
 
-The frontend remains deferred because this implementation request covers backend and ML. Its integration can proceed against the reconstructed API after contract review; final competition acceptance still requires the complete chat flow and debug UI.
+The frontend is now integrated against the refreshed API contract and included in the common Compose. Live-model acceptance, deployment and final submission materials remain; see the [current checklist](case-status.md).

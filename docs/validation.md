@@ -1,5 +1,15 @@
 # Energytool backend validation
 
+## 16 November: integrated checkout and Dokploy preparation
+
+- Merged `origin/main` through `4b41d36` into the local frontend branch; preserved the local interface changes and refreshed its generated API schema, including nullable progress and fixed topic labels.
+- Python 3.12.14 on Windows, `PYTHONUTF8=1`: **318 passed, 7 skipped**, 30.94 seconds. PostgreSQL tests are skipped without `TEST_POSTGRES_URL`. One existing Starlette/AnyIO deprecation warning remains.
+- Corrected Windows CSV output (`fchmod` fallback), validation of ZIP original names and worker behavior when the shared timeout fires before a monotonic-clock tick. POSIX permission checks remain on POSIX; a source-review budget test now uses a controlled clock instead of scheduler-dependent sleep.
+- **46 frontend tests passed** with Vitest threads/one worker; API production build and TypeScript passed. Browser tests were not run in this pass, at the user's request.
+- `docker compose config --quiet` passes both with and without the tooling profile. Prepared common frontend/API/PostgreSQL startup, named index/cache volumes, an ingestion job, and a read-only review proxy disabled by default. Docker Engine was not running, so the new images, Nginx runtime, PostgreSQL persistence and Dokploy deployment were not executed here.
+- Built `dist/submission.zip`: 14 root files, no corpus or credentials. The package was not submitted to the platform. No new live-Qwen quality/latency result or judge score is claimed.
+- Deployment steps: [Dokploy](dokploy.md). Remaining case requirements: [current checklist](case-status.md).
+
 Updated 14 November 2026. This record separates the current development checks from results recorded on 13 November. Historical results describe the code and environment tested at that time; they are not a claim that the latest code was rerun in every earlier environment.
 
 ## 14 November: v3 answer-quality correction

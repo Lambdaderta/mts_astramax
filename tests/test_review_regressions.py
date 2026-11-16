@@ -62,6 +62,28 @@ async def send(service, session_id, text):
     return result
 
 
+def test_source_review_time_is_preserved_in_trace_and_telemetry(service, caplog):
+    import logging
+    import json
+
+    async def consult(request):
+        return ConsultationResult(
+            kind='clarify', answer_text='Уточните объект.', reason_code='synthetic',
+            timings_ms={'generation': 12, 'review': 7, 'validation': 1, 'total': 20,
+                        'unknown': 99, 'rerank': float('nan')},
+        )
+
+    service.core.consult = consult
+    sid = service.create_session()['session']['id']
+    with caplog.at_level(logging.INFO, logger='uvicorn.error'):
+        result = asyncio.run(send(service, sid, 'Как выбрать решение?'))
+    trace = service.trace(result['assistant_message']['id'])
+    assert trace['timings_ms'] == {'generation': 12, 'review': 7, 'validation': 1, 'total': 20}
+    events = [json.loads(item.getMessage()) for item in caplog.records if item.getMessage().startswith('{')]
+    completed = next(item for item in events if item.get('event') == 'turn_completed')
+    assert completed['review_ms'] == 7
+
+
 def test_corrected_and_cleared_contact_names_stay_out_of_model_history(service):
     async def scenario():
         sid = service.create_session()["session"]["id"]

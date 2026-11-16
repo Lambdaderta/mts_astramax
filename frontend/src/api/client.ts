@@ -21,8 +21,11 @@ export interface ApiClientOptions { baseUrl?: string; fetch?: typeof fetch; requ
 export function createApiClient({ baseUrl = '/api/v1', fetch: fetcher = globalThis.fetch.bind(globalThis), requestTimeoutMs = 12_000 }: ApiClientOptions = {}) {
   const base = (baseUrl.trim() || '/api/v1').replace(/\/$/, '');
   return {
-    async request<T>(path: string, options: { method?: string; body?: unknown; token?: string; credentials?: RequestCredentials; timeoutMs?: number } = {}): Promise<T> {
+    async request<T>(path: string, options: { method?: string; body?: unknown; token?: string; credentials?: RequestCredentials; timeoutMs?: number; signal?: AbortSignal } = {}): Promise<T> {
       const controller = new AbortController();
+      const abort = () => controller.abort();
+      options.signal?.addEventListener('abort', abort, { once: true });
+      if (options.signal?.aborted) controller.abort();
       const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? requestTimeoutMs);
       try {
         const headers: Record<string, string> = { Accept: 'application/json' };
@@ -37,9 +40,10 @@ export function createApiClient({ baseUrl = '/api/v1', fetch: fetcher = globalTh
         if (data === null) throw new ApiError('Сервер вернул ответ неподдерживаемого формата.', 'INVALID_RESPONSE', response.status, false);
         return data as T;
       } catch (error) {
+        if (options.signal?.aborted) throw new ApiError('Получение ответа приостановлено. Повторите отправку, чтобы получить результат без дубликата.', 'REQUEST_CANCELLED');
         if (error instanceof ApiError) throw error;
         throw new ApiError(controller.signal.aborted ? 'Не дождались ответа сервера. Повторите отправку: сообщение не продублируется.' : 'Нет связи с сервером. Проверьте подключение и повторите отправку.', controller.signal.aborted ? 'REQUEST_TIMEOUT' : 'NETWORK_ERROR');
-      } finally { clearTimeout(timer); }
+      } finally { clearTimeout(timer); options.signal?.removeEventListener('abort', abort); }
     },
   };
 }

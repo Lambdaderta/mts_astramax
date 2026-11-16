@@ -1,4 +1,4 @@
-import type { ApiDraft, ApiLead, ChatService, DebugInfo, LeadInput, Message, Session, Stage } from '../types';
+import type { ApiDraft, ApiLead, ChatService, DebugInfo, LeadInput, Message, SendOptions, Session, Stage } from '../types';
 import { ApiError, createApiClient, errorWithRequest, type ApiClientOptions, type Schema } from './client';
 
 type Turn = Schema['TurnCompleted'] | Schema['TurnProcessing'] | Schema['TurnFailed'];
@@ -38,7 +38,21 @@ export function createApiService(options: ApiServiceOptions = {}): ChatService {
   const save = (session: Session) => { sessions.set(session.id, session); return clone(session); };
   const get = (id: string) => { const value = sessions.get(id); if (!value) throw new ApiError('Сессия недоступна. Начните новый диалог.', 'SESSION_NOT_FOUND', 404, false); return value; };
   const token = (id: string) => { const value = tokens.get(id); if (!value) throw new ApiError('Сессия недоступна. Начните новый диалог.', 'UNAUTHORIZED', 401, false); return value; };
-  const request = <T,>(id: string, path = '', method = 'GET', body?: unknown, timeoutMs?: number) => client.request<T>(endpoint(id) + path, { token: token(id), method, body, timeoutMs });
+  const request = <T,>(id: string, path = '', method = 'GET', body?: unknown, timeoutMs?: number, signal?: AbortSignal) => client.request<T>(endpoint(id) + path, { token: token(id), method, body, timeoutMs, signal });
+  const checkCancelled = (signal?: AbortSignal) => {
+    if (signal?.aborted) throw new ApiError('Получение ответа приостановлено. Повторите отправку, чтобы получить результат без дубликата.', 'REQUEST_CANCELLED');
+  };
+  async function pause(ms: number, signal?: AbortSignal) {
+    checkCancelled(signal);
+    let abort: () => void = () => undefined;
+    try {
+      await Promise.race([wait(ms), new Promise<never>((_, reject) => {
+        abort = () => reject(new ApiError('Получение ответа приостановлено. Повторите отправку, чтобы получить результат без дубликата.', 'REQUEST_CANCELLED'));
+        signal?.addEventListener('abort', abort, { once: true });
+      })]);
+      checkCancelled(signal);
+    } finally { signal?.removeEventListener('abort', abort); }
+  }
   const reviewRequest = <T,>(path: string) => {
     if (!options.reviewEnabled) throw new ApiError('Отладка доступна только в защищённом режиме проверки.', 'FORBIDDEN', 403, false);
     return review.request<T>(path, { credentials: 'same-origin' });
@@ -54,22 +68,26 @@ export function createApiService(options: ApiServiceOptions = {}): ChatService {
     } while (true);
     return [...new Map(all.map(item => [item.id, item])).values()].sort((a, b) => a.seq - b.seq).map(mapMessage);
   }
-  async function poll(id: string, initial: Turn, deadline: number): Promise<Schema['TurnCompleted']> {
+  async function poll(id: string, initial: Turn, deadline: number, opts: SendOptions): Promise<Schema['TurnCompleted']> {
     let turn = initial;
     let failures = 0;
     while (turn.status === 'processing') {
+      checkCancelled(opts.signal);
+      opts.onProgress?.(turn.progress ?? undefined);
       const remaining = deadline - Date.now();
       const delay = Math.max(50, Math.min(5000, turn.poll_after_ms ?? 700));
       if (remaining <= delay) throw new ApiError('Ответ ещё готовится. Повторите запрос, чтобы получить результат той же операции.', 'TURN_TIMEOUT');
-      await wait(delay);
-      try { turn = await request<Turn>(id, `/turns/${encode(turn.turn_id)}`, 'GET', undefined, Math.min(12_000, deadline - Date.now())); }
+      await pause(delay, opts.signal);
+      try { turn = await request<Turn>(id, `/turns/${encode(turn.turn_id)}?include_progress=true`, 'GET', undefined, Math.min(12_000, deadline - Date.now()), opts.signal); }
       catch (error) {
+        checkCancelled(opts.signal);
         if (!(error instanceof ApiError) || !error.retryable || Date.now() >= deadline || ++failures > 3) throw error;
         const delay = Math.max(Math.min(2000, 250 * 2 ** failures) + Math.random() * 100, error.retryAfterMs);
         if (Date.now() + delay >= deadline) throw error;
-        await wait(delay);
+        await pause(delay, opts.signal);
       }
     }
+    checkCancelled(opts.signal);
     if (turn.status === 'failed') throw new ApiError(turn.error.message, turn.error.code, 503, turn.error.retryable, turn.error.request_id, turn.error.details);
     return turn;
   }
@@ -128,6 +146,7 @@ export function createApiService(options: ApiServiceOptions = {}): ChatService {
       return save({ ...mapSession(response.session, get(id)), messages: await messages(id) });
     },
     async sendMessage(id, text, opts = {}) {
+      checkCancelled(opts.signal);
       const original = get(id);
       if (original.archived) throw new ApiError('Этот диалог закрыт. Начните новый.', 'SESSION_CLOSED', 409, false);
       const value = text.trim();
@@ -144,16 +163,18 @@ export function createApiService(options: ApiServiceOptions = {}): ChatService {
       const deadline = Date.now() + (options.pollTimeoutMs ?? 45_000);
       try {
         let result: Turn;
-        try { result = await request<Turn>(id, '/turns', 'POST', { client_message_id: clientId, text: operation.text }); }
+        try { result = await request<Turn>(id, '/turns?include_progress=true', 'POST', { client_message_id: clientId, text: operation.text }, undefined, opts.signal); }
         catch (error) {
           if (error instanceof ApiError && error.code === 'TURN_IN_PROGRESS' && typeof error.details.active_turn_id === 'string') {
-            const active = await poll(id, { status: 'processing', turn_id: error.details.active_turn_id, poll_after_ms: 700 }, deadline);
+            const active = await poll(id, { status: 'processing', turn_id: error.details.active_turn_id, poll_after_ms: 700 }, deadline, opts);
             await applyTurn(active);
-            result = await request<Turn>(id, '/turns', 'POST', { client_message_id: clientId, text: operation.text });
+            checkCancelled(opts.signal);
+            result = await request<Turn>(id, '/turns?include_progress=true', 'POST', { client_message_id: clientId, text: operation.text }, undefined, opts.signal);
           } else throw error;
         }
         operation.turnId = result.turn_id;
-        const complete = await poll(id, result, deadline);
+        const complete = await poll(id, result, deadline, opts);
+        checkCancelled(opts.signal);
         const next = await applyTurn(complete, clientId);
         pending.delete(clientId);
         return next;

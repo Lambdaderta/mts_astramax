@@ -694,6 +694,17 @@ export interface components {
              * @default 700
              */
             poll_after_ms: number;
+            progress?: components["schemas"]["TurnProgress"] | null;
+        };
+        /** TurnProgress */
+        TurnProgress: {
+            /**
+             * Stage
+             * @enum {string}
+             */
+            stage: "queued" | "analyzing" | "preparing_answer" | "finalizing";
+            /** Keywords */
+            keywords: ("Электроэнергия" | "Вода" | "Тепло" | "Газ" | "Счётчики" | "Тарифы")[];
         };
     };
     responses: never;
@@ -1379,7 +1390,10 @@ export interface operations {
     };
     post_turn_api_v1_sessions__session_id__turns_post: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Include current processing stage and topic labels in HTTP 202. */
+                include_progress?: boolean;
+            };
             header?: never;
             path: {
                 session_id: string;
@@ -1504,7 +1518,10 @@ export interface operations {
     };
     get_turn_api_v1_sessions__session_id__turns__turn_id__get: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Include current processing stage and topic labels in HTTP 202. */
+                include_progress?: boolean;
+            };
             header?: never;
             path: {
                 turn_id: string;

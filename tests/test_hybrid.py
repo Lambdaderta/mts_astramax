@@ -120,7 +120,8 @@ class HybridTests(unittest.IsolatedAsyncioTestCase):
         content = paths[0].read_text()
         self.assertNotIn("Панели вырабатывают", content)
         self.assertNotIn("Authorization", content)
-        self.assertEqual(paths[0].stat().st_mode & 0o777, 0o600)
+        if os.name == 'posix':
+            self.assertEqual(paths[0].stat().st_mode & 0o777, 0o600)
         data = json.loads(content)
         self.assertEqual(data["dimensions"], 3)
         self.assertEqual(len(data["cache_key"]), 64)

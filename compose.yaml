@@ -1,4 +1,20 @@
 services:
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_ENABLE_REVIEW: ${ENABLE_REVIEW:-false}
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-8080}:80"
+    environment:
+      API_UPSTREAM: http://api:8000
+      # This server-side token is never included in the JS build.
+      REVIEW_TOKEN: ${REVIEW_TOKEN:-}
+      ENABLE_REVIEW: ${ENABLE_REVIEW:-false}
+    restart: unless-stopped
   db:
     image: postgres:17.12-alpine
     environment:
@@ -61,17 +77,28 @@ services:
       EMBEDDING_MAX_RETRIES: ${EMBEDDING_MAX_RETRIES:-2}
       EMBEDDING_MODEL_REVISION: ${EMBEDDING_MODEL_REVISION:-}
       EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-}
-      EMBEDDING_CACHE_DIR: ${EMBEDDING_CACHE_DIR:-}
+      EMBEDDING_CACHE_DIR: ${EMBEDDING_CACHE_DIR:-/cache}
     volumes:
-      - type: bind
-        source: ${INDEX_DIR_HOST:-./private/index}
-        target: /private/index
-        read_only: true
+      - knowledge_index:/private/index:ro
+      - embedding_cache:/cache
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live', timeout=2)"]
+      start_period: 150s
       interval: 15s
       timeout: 3s
       retries: 3
     restart: unless-stopped
+  ingest:
+    profiles: [tools]
+    build: .
+    command: [python, scripts/ingest.py, --corpus-dir, /corpus, --index-dir, /private/index]
+    volumes:
+      - knowledge_index:/private/index
+      - type: bind
+        source: ${CORPUS_DIR_HOST:-../files/corpus}
+        target: /corpus
+        read_only: true
 volumes:
   postgres_data:
+  knowledge_index:
+  embedding_cache:

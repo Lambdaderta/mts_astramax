@@ -1,4 +1,5 @@
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
@@ -76,8 +77,9 @@ def test_parallel_index_saves_use_distinct_private_temporary_files(tmp_path, mon
     assert written == [output / "index.json"] * 2
     assert Corpus.load(output) in (first, second)
     assert len({path for path, _ in staging}) == 2
-    assert all(mode & 0o077 == 0 for _, mode in staging)
-    assert (output / "index.json").stat().st_mode & 0o077 == 0
+    if os.name == 'posix':
+        assert all(mode & 0o077 == 0 for _, mode in staging)
+        assert (output / "index.json").stat().st_mode & 0o077 == 0
     assert list(output.iterdir()) == [output / "index.json"]
 
 

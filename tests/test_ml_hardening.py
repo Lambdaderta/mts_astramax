@@ -37,7 +37,7 @@ def test_qwen_reasoning_envelope_only_exposes_final_json(content):
     ('<think><think>Nested</think></think>{"chunk_ids":[]}', "stop"),
     ('<think>First</think><think>Second</think>{"chunk_ids":[]}', "stop"),
     ('{"chunk_ids":[]}', "content_filter"),
-])
+], ids=['unclosed', 'truncated', 'oversized-reasoning', 'nested', 'repeated', 'filtered'])
 def test_truncated_or_unclosed_reasoning_is_not_an_answer(content, reason):
     response = httpx.Response(200, json={"choices": [{"finish_reason": reason, "message": {"content": content}}]})
     with pytest.raises(InvalidEvidence):

@@ -135,7 +135,8 @@ def extract_knowledge(archive_path: Path, destination: Path) -> int:
             raise SubmissionError("Knowledge archive exceeds the 256 MiB extraction limit")
         targets: set[str] = set()
         for entry in entries:
-            name = entry.filename
+            # ZipInfo normalizes backslashes on Windows; inspect the original too.
+            name = entry.orig_filename
             path = PurePosixPath(name)
             if (
                 not name or "\\" in name or "\x00" in entry.orig_filename
@@ -244,7 +245,9 @@ async def answer_questions(
                     answers[index] = question.id, CONTACT_REQUEST_ANSWER
                     outcomes[index] = "handoff", "manager_requested", False
                     continue
-                async with asyncio.timeout(min(remaining, deadline - time.monotonic())):
+                available = deadline - time.monotonic()
+                total_budget_limited = available <= case_timeout_seconds
+                async with asyncio.timeout(min(remaining, available)):
                     result = await core.consult(request)
                 if retrieval_counts is not None:
                     retrieval_mode = result.model_metadata.get("retrieval_mode", "unknown")
@@ -264,6 +267,10 @@ async def answer_questions(
                 continue
             except TimeoutError:
                 outcomes[index] = "error", "case_timeout", True
+                # Event-loop timers may fire slightly before monotonic() reaches
+                # the deadline. Never start another case after the total timer.
+                if total_budget_limited:
+                    return
                 continue
             except Exception as error:
                 # Isolate unexpected provider/core errors to their case. Error
@@ -310,7 +317,10 @@ def write_submission(path: Path, answers: list[tuple[str, str]]) -> None:
             stream.flush()
             # The platform may read this result from a separate grading user.
             # Private corpus/index/cache files retain their existing permissions.
-            os.fchmod(stream.fileno(), 0o644)
+            if hasattr(os, 'fchmod'):
+                os.fchmod(stream.fileno(), 0o644)
+            else:
+                os.chmod(temporary, 0o644)
             os.fsync(stream.fileno())
         os.replace(temporary, path)
     finally:

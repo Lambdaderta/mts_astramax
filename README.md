@@ -6,6 +6,10 @@ The supplied team specification was used for the REST design. During implementat
 
 ## Run
 
+### Complete application / Dokploy
+
+`docker compose up -d --build` starts the frontend at `http://localhost:8080`, the API and PostgreSQL. The frontend proxies API requests on the same origin. See [Dokploy setup](docs/dokploy.md) for configuration, private-corpus ingestion and domain setup, and [case checklist](docs/case-status.md) for remaining delivery work.
+
 ### Frontend
 
 The React + TypeScript frontend is in [`frontend/`](frontend/README.md). Requires Node.js 22.12+ or 24+:
@@ -39,7 +43,7 @@ docker compose up --build
 
 The API binds to localhost port 8000 (`API_PORT` overrides it). Compose starts PostgreSQL 17 on its internal network and stores its data in `postgres_data`. The default password is for local use. Set `POSTGRES_PASSWORD` for a shared instance, or provide `DATABASE_URL` for a managed PostgreSQL database. The direct Python command uses `DATABASE_URL` if set, or the local SQLite file from `DATABASE_PATH` otherwise.
 
-The private index is mounted read-only from `./private/index` or `INDEX_DIR_HOST`. Without an index, session and contact workflows remain available, `/health/ready` returns 503, and product questions receive an explicit knowledge-unavailable response. `/health/live` checks the running process. See [validation results](docs/validation.md) for the container checks.
+The private index is mounted read-only from the `knowledge_index` named volume; embeddings persist in `embedding_cache`. Set `CORPUS_DIR_HOST` to the directory containing the issued documents, run `docker compose --profile tools run --build --rm --no-deps ingest`, then restart the API. Without an index, session and contact workflows remain available and `/health/ready` returns 503. `/health/live` checks the running process. See [validation results](docs/validation.md) for historical container checks and [Dokploy setup](docs/dokploy.md) for the new deployment configuration.
 
 ### Import existing SQLite history
 
@@ -174,4 +178,4 @@ Live Qwen response quality and latency remain unverified. Claim validation is de
 
 Dialogue reasoning uses bounded history and stores explicit meter counts by resource with their source message. A later correction supersedes the previous value for that resource. General semantic facts, structured product recommendations and model-based reranking remain open. Manager summaries use the latest substantive customer messages, retained facts and the latest outstanding consultation question when available.
 
-The chat frontend, presentation, deployment, CRM integration and competition upload were outside this backend/ML pass. [Integration questions](docs/integration-questions.md) lists the remaining external inputs; the most useful next step is a run against the organizer proxy, followed by reviewing the 18 demo answers and the real frontend contract.
+The integrated frontend and deployment configuration are now included. Remaining work is live-model acceptance, an actual Dokploy deployment, platform scoring and the final presentation; see the [current case checklist](docs/case-status.md). A real CRM connection is not required by the case.

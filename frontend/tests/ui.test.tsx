@@ -6,8 +6,31 @@ import { Workspace } from '../src/App';
 import Archive from '../src/Archive';
 import { createMockService } from '../src/service';
 import { demoFixture, memoryStorage } from '../src/demo';
+import type { SendOptions } from '../src/types';
 
 describe('Рабочий интерфейс', () => {
+  it('смена диалога отменяет отправку и игнорирует поздний прогресс', async () => {
+    const user = userEvent.setup();
+    const service = createMockService(memoryStorage(demoFixture('products')), 0);
+    let finish!: () => void;
+    let sending: SendOptions | undefined;
+    vi.spyOn(service, 'sendMessage').mockImplementation(async (id, _text, options) => {
+      sending = options;
+      options?.onProgress?.({ stage: 'analyzing', keywords: ['Газ'] });
+      await new Promise<void>(resolve => { finish = resolve; });
+      options?.onProgress?.({ stage: 'finalizing', keywords: ['Вода'] });
+      return (await service.listSessions()).find(item => item.id === id)!;
+    });
+    render(<MemoryRouter><Workspace service={service} demoState="products" /></MemoryRouter>);
+    const input = await screen.findByRole('textbox', { name: 'Сообщение' });
+    await user.type(input, 'Тариф на газ{Enter}');
+    expect(screen.getByRole('status')).toHaveTextContent('Газ');
+    await user.click(screen.getByRole('button', { name: /Счётчики для СНТ, 120 домов/ }));
+    expect(sending?.signal?.aborted).toBe(true);
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    finish();
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument());
+  });
   it('показывает ошибку телефона и не отправляет форму без согласия', async () => {
     const user = userEvent.setup(); const submit = vi.fn().mockResolvedValue(undefined);
     render(<LeadForm onSubmit={submit} pending={false} />);

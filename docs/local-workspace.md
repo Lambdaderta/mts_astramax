@@ -13,7 +13,7 @@ INDEX_DIR=/path/to/private/index \
   .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --no-access-log
 ```
 
-With Docker, set `INDEX_DIR_HOST` to the index directory. Index files are written with owner-only permissions. On a Linux bind mount, grant the container user (UID 10001) read access to the index and traversal access to the mounted directory through ownership or a file ACL. Keep the mount read-only.
+With the current Compose, set `CORPUS_DIR_HOST` to the document directory and run `docker compose --profile tools run --build --rm --no-deps ingest`. Index files are stored in the `knowledge_index` named volume, read-only for the API. The container user (UID 10001) needs read and traversal access to the source directory. See [Dokploy setup](dokploy.md) for server paths and project names.
 
 For a local file-format check, point the platform adapter at the directory holding `questions.csv` and `knowledge-base.zip`. The offline run uses the lexical baseline and writes a private output file.
 

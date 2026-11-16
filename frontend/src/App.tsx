@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import type { ChatService, DebugInfo, LeadInput, Product, Session } from './types';
+import type { ChatService, DebugInfo, LeadInput, Product, Session, TurnProgress } from './types';
+import { TurnIndicator } from './TurnIndicator';
 import { createMockService, getLastDebug } from './service';
 import { appService } from './runtime';
 import { errorWithRequest } from './api/client';
@@ -39,6 +40,9 @@ export function Workspace({ service = appService, demoState }: { service?: ChatS
   const [demoId, setDemoId] = useState(demoState === 'readonly' ? 'snt' : 'demo-current');
   const [draft, setDraft] = useState('');
   const [pendingId, setPendingId] = useState<string>();
+  const [progress, setProgress] = useState<TurnProgress>();
+  const operationRef = useRef<{ id: string; controller: AbortController } | undefined>(undefined);
+  const mounted = useRef(true);
   const [submitting, setSubmitting] = useState(false);
   const [collapsed, setCollapsed] = useState(demoState === 'collapsed');
   const [debug, setDebug] = useState(demoState?.startsWith('debug') || demoState === 'scope');
@@ -99,7 +103,16 @@ export function Workspace({ service = appService, demoState }: { service?: ChatS
   }, [api, debug, canDebug, selectedMessage, latestBot?.id, service]);
   useEffect(() => {
     setDraft(''); setMobileHistory(false); setError(undefined); setSelectedMessage(undefined); nearBottom.current = true;
+    const operation = operationRef.current;
+    if (operation && operation.id !== currentId) {
+      operation.controller.abort(); operationRef.current = undefined;
+      setPendingId(undefined); setProgress(undefined); busyRef.current = false;
+    }
   }, [currentId]);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; operationRef.current?.controller.abort(); };
+  }, []);
   useEffect(() => {
     if (nearBottom.current) bottomRef.current?.scrollIntoView?.({ block: 'end' });
   }, [session?.messages.length, session?.stage, typing, currentId, debug, loaded]);
@@ -109,16 +122,28 @@ export function Workspace({ service = appService, demoState }: { service?: ChatS
     if (busyRef.current || readonly || !text.trim()) return;
     busyRef.current = true; setError(undefined); nearBottom.current = true;
     setSelectedMessage(undefined);
+    let operation: { id: string; controller: AbortController } | undefined;
     try {
       let active = session;
       if (!active) { active = await service.createSession(); await refresh(); select(active.id); }
       setPendingId(active.id); setDraft(''); setDemoTyping(false);
+      setProgress(undefined);
+      operation = { id: active.id, controller: new AbortController() };
+      operationRef.current = operation;
       // Optimistic feedback; service retains the canonical persisted message.
       if (!retryId) setSessions(prev => prev.map(item => item.id === active!.id ? { ...item, messages: [...item.messages, { id: 'optimistic', role: 'user', text: text.trim(), delivery: 'sent' }] } : item));
-      await service.sendMessage(active.id, text, { retryId, simulateError: !navigator.onLine });
-      await refresh();
-    } catch (err) { setError(errorText(err)); setDraft(text); await refresh().catch(() => undefined); }
-    finally { setPendingId(undefined); busyRef.current = false; }
+      await service.sendMessage(active.id, text, { retryId, simulateError: !navigator.onLine, signal: operation.controller.signal, onProgress: value => {
+        if (mounted.current && operationRef.current === operation && !operation!.controller.signal.aborted) setProgress(value);
+      } });
+      if (mounted.current) await refresh();
+    } catch (err) {
+      if (mounted.current && !operation?.controller.signal.aborted) { setError(errorText(err)); setDraft(text); await refresh().catch(() => undefined); }
+    } finally {
+      if (!operation || operationRef.current === operation) {
+        operationRef.current = undefined; busyRef.current = false;
+        if (mounted.current) { setPendingId(undefined); setProgress(undefined); }
+      }
+    }
   }
   async function newDialog(fromId?: string) {
     if (busyRef.current) return;
@@ -171,7 +196,7 @@ export function Workspace({ service = appService, demoState }: { service?: ChatS
                 </div>
                 {message.delivery === 'failed' && <button className={s.failedBadge} onClick={() => void send(message.text, message.id)} disabled={retryBlocked}>{retryBlocked && message.retryable === false ? 'Отправку не удалось завершить' : 'Не отправлено. Нажмите, чтобы повторить'}</button>}
               </div>)}
-              {typing && <div className={s.message} role="status" aria-label="Помощник печатает"><span className={`${s.avatar} ${s.messageAvatar}`}><Icon name="bot" /></span><div className={s.typing}><span /><span /><span /></div></div>}
+              {typing && <TurnIndicator progress={progress} />}
               {!typing && failed && <><div className={s.message}><span className={`${s.avatar} ${s.messageAvatar}`}><Icon name="bot" /></span><p className={s.bubble}>{failed.error || 'Нет связи. Ваше сообщение сохранено. Проверьте интернет и повторите'}</p></div>{session?.accessError ? <Button className={s.retry} onClick={requestNew}>Новый диалог</Button> : <Button className={s.retry} disabled={retryBlocked} onClick={() => void send(failed.text, failed.id)}>{(failed.retryAt ?? 0) > clock ? `Повторить через ${Math.ceil(((failed.retryAt ?? 0) - clock) / 1000)} с` : 'Повторить'}</Button>}</>}
               {!typing && !failed && session && <>
                 {!api && ['products', 'solar'].includes(stage) && <ProductCards products={productsFor(stage).map(p => debug && p.id === 'platform' ? { ...p, description: p.description.replace(' Ограничений по числу приборов нет.', '') } : p)} onDetails={setDetails} readonly={readonly} />}

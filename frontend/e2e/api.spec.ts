@@ -13,8 +13,9 @@ function fixtures() {
   const state = (phase: Schema['Session']['phase'] = 'new'): Schema['Session'] => ({ id: current, status: 'active', phase, revision: 1, opened_at: stamp, closed_at: null });
   const draft = (): Schema['Draft'] => ({ ...contacts, revision, status: contacts.phone ? contacts.full_name && contacts.company ? 'complete' : 'partial' : 'draft', missing_fields: (['full_name', 'phone', 'company'] as const).filter(key => !contacts[key]) });
   const preview = (): Schema['Preview'] => ({ ...contacts, preview_id: `00000000-0000-4000-8000-${String(previewNumber).padStart(12, '0')}`, snapshot_last_seq: 3, draft_revision: revision, status: draft().status, can_confirm: !!contacts.phone, client_problem: 'Серверная задача', summary: `Серверное резюме ${previewNumber}`, facts: [{ key: 'Объект', value: 'Кафе', source_message_id: 'user-1' }], recommended_products: ['Рекомендация из базы'], open_questions: ['Уточнить профиль потребления'], missing_fields: draft().missing_fields });
-  return { calls, state, preview, async install(page: Page, options: { form?: boolean; async?: boolean; failed?: boolean; stale?: boolean; rateLimited?: boolean } = {}) {
+  return { calls, state, preview, async install(page: Page, options: { form?: boolean; async?: boolean; progress?: boolean; failed?: boolean; stale?: boolean; rateLimited?: boolean } = {}) {
     let failed = false; let stale = false;
+    let polls = 0;
     await page.route('**/api/v1/**', async route => {
       const request = route.request(); const path = new URL(request.url()).pathname;
       const body = request.postDataJSON(); const method = request.method();
@@ -32,10 +33,14 @@ function fixtures() {
         const existing = turns.get(body.client_message_id);
         const result: Schema['TurnCompleted'] = existing ?? { turn_id: 'turn-1', status: 'completed', session: state(options.form ? 'collecting_contacts' : 'consulting'), user_message: { id: 'user-1', seq: 2, role: 'user', text: body.text, created_at: stamp }, assistant_message: { id: 'assistant-1', seq: 3, role: 'assistant', text: options.form ? 'Укажите контакты для заявки.' : 'Ответ API <script>window.apiInjected = true</script>', created_at: stamp }, decision: { kind: options.form ? 'collecting_contacts' : 'answer', reason_code: 'grounded_answer' }, lead_draft: options.form ? draft() : null };
         turns.set(body.client_message_id, result);
+        if (options.progress) return respond({ status: 'processing', turn_id: result.turn_id, poll_after_ms: 1500, progress: { stage: 'preparing_answer', keywords: ['Газ', 'Тарифы'] } }, 202);
         if (options.async) return respond({ status: 'processing', turn_id: result.turn_id, poll_after_ms: 50 }, 202);
         return respond(result);
       }
-      if (path.endsWith('/turns/turn-1')) return respond([...turns.values()].at(-1));
+      if (path.endsWith('/turns/turn-1')) {
+        if (options.progress && polls++ === 0) return respond({ status: 'processing', turn_id: 'turn-1', poll_after_ms: 500, progress: { stage: 'finalizing', keywords: [] } }, 202);
+        return respond([...turns.values()].at(-1));
+      }
       if (path.endsWith('/lead-draft')) { if (method === 'PATCH') { expect(body.expected_revision).toBe(revision); Object.assign(contacts, body.fields); revision++; } return respond({ draft: draft() }); }
       if (path.endsWith('/lead-preview')) { previewNumber++; return respond(preview()); }
       if (path.endsWith('/leads')) {
@@ -46,6 +51,39 @@ function fixtures() {
     });
   } };
 }
+
+for (const width of [1440, 390]) {
+  test(`API: этапы подготовки и метки на ширине ${width}`, async ({ page }, testInfo) => {
+    await page.setViewportSize({ width, height: 960 });
+    const api = fixtures(); await api.install(page, { progress: true });
+    await page.goto('/');
+    await page.getByRole('textbox', { name: 'Сообщение' }).fill('Какой тариф на газ?');
+    await page.getByRole('button', { name: 'Отправить сообщение' }).click();
+    const status = page.getByRole('status');
+    await expect(status).toContainText('Готовлю ответ');
+    await expect(status).toContainText('Газ');
+    await expect(status).toContainText('Тарифы');
+    await page.screenshot({ path: testInfo.outputPath(`progress-${width}.png`) });
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    await expect(status).toContainText('Сохраняю результат');
+    await expect(status).not.toContainText('Газ');
+    await expect(page.getByText('Ответ API <script>window.apiInjected = true</script>', { exact: true })).toBeVisible();
+    await expect(status).toHaveCount(0);
+  });
+}
+
+test('API: уход со страницы останавливает опрос подготовки', async ({ page }) => {
+  const api = fixtures(); await api.install(page, { progress: true });
+  await page.goto('/');
+  await page.getByRole('textbox', { name: 'Сообщение' }).fill('Какой тариф на газ?');
+  await page.getByRole('button', { name: 'Отправить сообщение' }).click();
+  await expect(page.getByRole('status')).toContainText('Газ');
+  await page.getByRole('link', { name: 'МТС Energytool — архив результатов' }).click();
+  await expect(page).toHaveURL(/\/archive$/);
+  await expect(page.getByRole('status')).toHaveCount(0);
+  await page.waitForTimeout(1800);
+  expect(api.calls.filter(call => call.path.includes('/turns/turn-1'))).toHaveLength(0);
+});
 
 test('API: приветствие, 202, безопасный текст и новая сессия после reload', async ({ page }) => {
   const api = fixtures(); await api.install(page, { async: true });

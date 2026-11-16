@@ -23,7 +23,7 @@ from .telemetry import record
 
 DATABASE_MAX_INT = 2**63 - 1
 CONTEXT_MESSAGES = 32
-TURN_STAGES = ('retrieval','rerank','generation','validation')
+TURN_STAGES = ('retrieval','rerank','generation','review','validation')
 
 
 def uid():

@@ -48,6 +48,13 @@ export interface Session {
 }
 export interface ArchiveFile { id: string; name: string; date: string; user: string; }
 export interface LeadInput { fullName: string; phone: string; company: string; consent: boolean; }
+export type TurnProgress = components['schemas']['TurnProgress'];
+export interface SendOptions {
+  retryId?: string;
+  simulateError?: boolean;
+  signal?: AbortSignal;
+  onProgress?: (progress?: TurnProgress) => void;
+}
 export interface ChatService {
   readonly mode?: 'mock' | 'api';
   readonly reviewAvailable?: boolean;
@@ -64,7 +71,7 @@ export interface ChatService {
   getReviewLead?(id: string): Promise<ApiLead>;
   listSessions(): Promise<Session[]>;
   createSession(fromSessionId?: string): Promise<Session>;
-  sendMessage(sessionId: string, text: string, options?: { retryId?: string; simulateError?: boolean }): Promise<Session>;
+  sendMessage(sessionId: string, text: string, options?: SendOptions): Promise<Session>;
   submitLead(sessionId: string, input: LeadInput): Promise<Session>;
   listArchive(): Promise<ArchiveFile[]>;
   downloadArchive(id: string): Promise<Blob>;

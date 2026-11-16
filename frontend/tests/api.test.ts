@@ -35,7 +35,7 @@ describe('API из OpenAPI', () => {
     const session = await service.sendMessage(sid, 'Вопрос');
     expect(session.messages.map(m => m.id)).toEqual(['greeting', 'user-1', 'assistant-1']);
     expect(fetch.mock.calls[1][1]?.headers).toMatchObject({ Authorization: 'Bearer test-session-secret' });
-    expect(fetch.mock.calls[1][0]).toBe(`/api/v1/sessions/${sid}/turns`);
+    expect(fetch.mock.calls[1][0]).toBe(`/api/v1/sessions/${sid}/turns?include_progress=true`);
   });
   it('опрашивает 202 до завершения, не создавая новый turn', async () => {
     const fetch = transport([json(created, 201), json({ turn_id: 'turn-1', status: 'processing', poll_after_ms: 1 }, 202), json({ turn_id: 'turn-1', status: 'processing', poll_after_ms: 1 }, 202), json(completed())]);
@@ -44,6 +44,40 @@ describe('API из OpenAPI', () => {
     expect(session.messages.at(-1)?.text).toBe('Ответ сервера');
     expect(fetch.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(2);
     expect(fetch.mock.calls[2][0]).toContain('/turns/turn-1');
+  });
+  it('передаёт реальные этапы и отсутствие прогресса из последовательных ответов', async () => {
+    const first = { stage: 'analyzing', keywords: ['Газ', 'Тарифы'] };
+    const last = { stage: 'finalizing', keywords: [] };
+    const fetch = transport([json(created, 201), json({ turn_id: 'turn-1', status: 'processing', progress: first }, 202), json({ turn_id: 'turn-1', status: 'processing' }, 202), json({ turn_id: 'turn-1', status: 'processing', progress: last }, 202), json(completed())]);
+    const onProgress = vi.fn(); const wait = vi.fn(async () => undefined);
+    const service = createApiService({ fetch, wait }); await service.createSession();
+    await service.sendMessage(sid, 'Вопрос', { onProgress });
+    expect(onProgress.mock.calls.map(([value]) => value)).toEqual([first, undefined, last]);
+    expect(wait).toHaveBeenCalledTimes(3);
+    for (const [url] of fetch.mock.calls.slice(1)) expect(url).toContain('include_progress=true');
+  });
+  it('отмена во время паузы останавливает polling, повтор сохраняет исходный UUID', async () => {
+    const controller = new AbortController();
+    const fetch = transport([json(created, 201), json({ turn_id: 'turn-1', status: 'processing' }, 202), json(completed())]);
+    const service = createApiService({ fetch, wait: async () => { controller.abort(); } }); await service.createSession();
+    const interrupted = await service.sendMessage(sid, 'Вопрос', { signal: controller.signal });
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(interrupted.messages.at(-1)?.delivery).toBe('failed');
+    await service.sendMessage(sid, 'Вопрос', { retryId: interrupted.messages.at(-1)!.id });
+    expect(fetch.mock.calls[1][1]?.body).toBe(fetch.mock.calls[2][1]?.body);
+  });
+  it('игнорирует ответ запроса, завершившегося после отмены', async () => {
+    const controller = new AbortController();
+    const base = transport([json(created, 201), json(completed())]);
+    const fetch = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
+      const response = await base(url, init);
+      if (init?.method === 'POST' && String(url).includes('/turns')) controller.abort();
+      return response;
+    });
+    const service = createApiService({ fetch }); await service.createSession();
+    const result = await service.sendMessage(sid, 'Вопрос', { signal: controller.signal });
+    expect(result.messages.some(m => m.id === 'assistant-1')).toBe(false);
+    expect(result.messages.at(-1)?.delivery).toBe('failed');
   });
   it('сохраняет client_message_id при сетевой ошибке и повторе', async () => {
     const fetch = transport([json(created, 201), new TypeError('offline'), json(completed())]);

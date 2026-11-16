@@ -19,7 +19,7 @@ Build a Russian-language Energytool sales consultant that takes a visitor from a
 | Process independent automated test cases through `solution.py` | p. 7; recovered technical regulation §§2–4 | Reuse the consultation core behind a separate CSV platform adapter |
 | Reproducible Docker launch and fixed dependencies | p. 8 | Container configuration, environment template and documented local verification |
 
-The user requested backend and ML work. The chat frontend, its debug interface, presentation, deployment and competition submission are deferred. A complete competition entry still needs a working chat interface, all submission materials and a positive automated-judge result (case pp. 8, 11). API functionality alone does not establish final-entry eligibility.
+Update, 16 November: the chat frontend and debug interface are included, API schemas are synchronized, and a common Docker Compose plus Dokploy instructions are prepared. Live-model acceptance, deployment, the presentation and current-version scoring remain. See the [current case checklist](case-status.md). API functionality alone does not establish final-entry eligibility.
 
 ## Source hierarchy and limits
 

@@ -1,0 +1,11 @@
+node_modules
+dist
+dist-api
+test-results*
+playwright-report
+.env
+.env.*
+!.env.api
+*.tsbuildinfo
+tmp
+.git

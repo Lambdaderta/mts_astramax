@@ -1,5 +1,6 @@
 """Source-review orchestration, not a claim about a live review model's accuracy."""
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -156,14 +157,16 @@ def test_answerable_questions_are_not_preempted_by_broad_regexes(tmp_path, query
     model.assert_awaited_once()
 
 
-def test_review_shares_original_deadline(tmp_path):
+def test_review_shares_original_deadline(tmp_path, monkeypatch):
     core = make_core(tmp_path, "Учебный стенд принимает показания датчиков.")
     payload = answer(core, "Учебный стенд получает данные от датчиков.")
     budgets = []
+    clock = [100.0]
+    monkeypatch.setattr('app.ml.core.time', SimpleNamespace(perf_counter=lambda: clock[0]))
 
     async def model(policy, data, budget):
         budgets.append(budget)
-        await asyncio.sleep(0.01)
+        clock[0] += 0.02
         return payload
 
     core.selector._json_response = model
